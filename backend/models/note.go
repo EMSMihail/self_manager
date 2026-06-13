@@ -8,4 +8,5 @@ type Note struct {
 	CreatedAt time.Time `json:"created_at"`
 	Deadline  *time.Time `json:"deadline"`
     Notified  bool      `json:"notified"`
+	Status    string     `json:"status"`
 }

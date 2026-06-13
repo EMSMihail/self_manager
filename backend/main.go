@@ -57,6 +57,22 @@ func notesHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(http.StatusOK)
 
+	case http.MethodPut:
+		var updateData struct {
+			ID     int    `json:"id"`
+			Status string `json:"status"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&updateData); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		
+		if err := db.UpdateNoteStatus(updateData.ID, updateData.Status); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -64,7 +80,7 @@ func notesHandler(w http.ResponseWriter, r *http.Request) {
 
 func startNotificationWorker() {
     loc, _ := time.LoadLocation("Europe/Moscow")
-    ticker := time.NewTicker(1 * time.Minute)
+    ticker := time.NewTicker(10 * time.Second)
 
     go func() {
         for range ticker.C {
@@ -82,9 +98,9 @@ func startNotificationWorker() {
                 var content, deadlineStr string
                 rows.Scan(&id, &content, &deadlineStr)
 
-                deadlineTime, err := time.ParseInLocation("2006-01-02T15:04:05Z", deadlineStr, loc)
+                deadlineTime, err := time.Parse(time.RFC3339, deadlineStr)
                 if err != nil {
-                    deadlineTime, err = time.ParseInLocation("2006-01-02T15:04", deadlineStr, loc)
+                    deadlineTime = deadlineTime.In(loc)
                 }
 
                 if err == nil && now.After(deadlineTime) {

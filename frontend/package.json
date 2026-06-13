@@ -27,6 +27,7 @@
 		"vite": "^8.0.16"
 	},
 	"dependencies": {
-		"dexie": "^4.4.3"
+		"dexie": "^4.4.3",
+		"svelte-dnd-action": "^0.9.70"
 	}
 }

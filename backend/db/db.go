@@ -23,10 +23,14 @@ func InitDB(filepath string) error {
 		content TEXT NOT NULL,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		deadline DATETIME,
-    	notified BOOLEAN DEFAULT 0
+    	notified BOOLEAN DEFAULT 0,
+        status TEXT DEFAULT 'todo'
 	);`
 	
 	_, err = DB.Exec(query)
+
+    DB.Exec("ALTER TABLE notes ADD COLUMN status TEXT DEFAULT 'todo'")
+
 	return err
 }
 
@@ -45,7 +49,7 @@ func DeleteNote(id int) error {
 }
 
 func GetAllNotes() ([]models.Note, error) {
-	rows, err := DB.Query("SELECT id, content, created_at, deadline, notified FROM notes ORDER BY created_at DESC")
+	rows, err := DB.Query("SELECT id, content, created_at, deadline, notified, status FROM notes ORDER BY created_at DESC")
     if err != nil {
         return nil, err
     }
@@ -56,7 +60,7 @@ func GetAllNotes() ([]models.Note, error) {
         var n models.Note
         // Используем sql.NullTime для deadline, так как он может быть NULL
         var deadline sql.NullTime
-        err := rows.Scan(&n.ID, &n.Content, &n.CreatedAt, &deadline, &n.Notified)
+        err := rows.Scan(&n.ID, &n.Content, &n.CreatedAt, &deadline, &n.Notified, &n.Status)
         if err != nil {
             return nil, err
         }
@@ -66,4 +70,9 @@ func GetAllNotes() ([]models.Note, error) {
         notes = append(notes, n)
     }
     return notes, nil
+}
+
+func UpdateNoteStatus(id int, status string) error {
+	_, err := DB.Exec("UPDATE notes SET status = ? WHERE id = ?", status, id)
+	return err
 }

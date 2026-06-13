@@ -12,3 +12,12 @@ export async function sendNoteToBackend(note) {
     });
     return res.ok;
 }
+
+export async function updateNoteStatusInBackend(id, status) {
+    const res = await fetch('/api/notes', {
+        method: 'PUT',
+        body: JSON.stringify({ id, status }),
+        headers: { 'Content-Type': 'application/json' }
+    });
+    return res.ok;
+}
