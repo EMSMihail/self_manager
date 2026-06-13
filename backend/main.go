@@ -1,16 +1,19 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"self-manager/bot"
 	"self-manager/db"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -20,6 +23,7 @@ func notesHandler(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		notes, err := db.GetAllNotes()
 		if err != nil {
+			slog.Error("Не удалось получить заметки", "err", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -33,18 +37,22 @@ func notesHandler(w http.ResponseWriter, r *http.Request) {
 			Priority string `json:"priority"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&n); err != nil {
+			slog.Warn("Ошибка декодирования POST body", "err", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		
 		if err := db.AddNote(n.Content, n.Deadline, n.Priority); err != nil {
+			slog.Error("Ошибка добавления заметки в БД", "err", err, "content", n.Content)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		token := os.Getenv("TELEGRAM_TOKEN")
 		chatID := os.Getenv("TELEGRAM_CHAT_ID")
-		bot.SendMessage(token, chatID, "🆕 Новая заметка: " + n.Content)
+		if token != "" && chatID != "" {
+			bot.SendMessage(token, chatID, "🆕 Новая заметка: "+n.Content)
+		}
 		w.WriteHeader(http.StatusCreated)
 	
 	case http.MethodDelete:
@@ -52,6 +60,7 @@ func notesHandler(w http.ResponseWriter, r *http.Request) {
 		idStr := r.URL.Query().Get("id")
 		id, _ := strconv.Atoi(idStr)
 		if err := db.DeleteNote(id); err != nil {
+			slog.Error("Ошибка удаления заметки", "err", err, "id", id)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -64,14 +73,16 @@ func notesHandler(w http.ResponseWriter, r *http.Request) {
 			Deadline string `json:"deadline"`
 			Status   string `json:"status"`
 			Notified bool   `json:"notified"`
-			Priority string `json:"priority"` // Добавили
+			Priority string `json:"priority"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&updateData); err != nil {
+			slog.Warn("Ошибка декодирования PUT body", "err", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		
 		if err := db.UpdateNote(updateData.ID, updateData.Content, updateData.Deadline, updateData.Status, updateData.Notified, updateData.Priority); err != nil {
+			slog.Error("Ошибка обновления заметки", "err", err, "id", updateData.ID)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -82,16 +93,25 @@ func notesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func startNotificationWorker() {
+func startNotificationWorker(ctx context.Context) {
 	loc, _ := time.LoadLocation("Europe/Moscow")
 	ticker := time.NewTicker(10 * time.Second)
 
 	go func() {
-		for range ticker.C {
-			log.Println("Воркер проверяет БД...")
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				slog.Info("Фоновый воркер уведомлений успешно остановлен")
+				return
+			case <-ticker.C:
+				slog.Info("Воркер проверяет БД...")
 			
-			rows, err := db.DB.Query("SELECT id, content, deadline, priority FROM notes WHERE notified = 0 AND deadline IS NOT NULL")
-			if err != nil { continue }
+				rows, err := db.DB.Query("SELECT id, content, deadline, priority FROM notes WHERE notified = 0 AND deadline IS NOT NULL AND status = 'todo'")
+				if err != nil {
+					slog.Error("Ошибка выполнения запроса в воркере", "err", err)
+					continue
+				}
 			
 			now := time.Now().In(loc)
 			var idsToNotify []int
@@ -99,7 +119,10 @@ func startNotificationWorker() {
 			for rows.Next() {
 				var id int
 				var content, deadlineStr, priority string
-				rows.Scan(&id, &content, &deadlineStr, &priority)
+					if err := rows.Scan(&id, &content, &deadlineStr, &priority); err != nil {
+						slog.Error("Ошибка сканирования строки в воркере", "err", err)
+						continue
+					}
 
 				deadlineTime, err := time.Parse(time.RFC3339, deadlineStr)
 				if err == nil {
@@ -113,13 +136,17 @@ func startNotificationWorker() {
 					// Подбираем эмодзи под уровень важности
 					emoji := "🟡"
 					switch priority {
-					case "high": emoji = "🔴"
-					case "low":  emoji = "🟢"
+						case "high":
+							emoji = "🔴"
+						case "low":
+							emoji = "🟢"
 					}
 					
 					msgText := fmt.Sprintf("%s *Напоминание (%s приоритет):*\n\n%s", emoji, strings.ToUpper(priority), content)
 					if err := bot.SendMessageWithButtons(token, chatID, msgText, id); err == nil {
 						idsToNotify = append(idsToNotify, id) 
+						} else {
+							slog.Error("Ошибка отправки сообщения через ТГ бот", "err", err, "note_id", id)
 					}
 				}
 			}
@@ -128,7 +155,8 @@ func startNotificationWorker() {
 			for _, id := range idsToNotify {
 				_, err := db.DB.Exec("UPDATE notes SET notified = 1 WHERE id = ?", id)
 				if err != nil {
-					log.Printf("Ошибка при пометке ID=%d: %v", id, err)
+						slog.Error("Ошибка при пометке notified=1 в БД", "err", err, "id", id)
+					}
 				}
 			}
 		}
@@ -136,11 +164,15 @@ func startNotificationWorker() {
 }
 
 func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(logger)
+
 	staticPath := "./frontend/build"
 
 	// Инициализация БД
 	if err := db.InitDB("./data/manager.db"); err != nil {
-		log.Fatal(err)
+		slog.Error("Критическая ошибка инициализации БД", "err", err)
+		os.Exit(1)
 	}
 
 	// API Маршруты
@@ -160,6 +192,10 @@ func main() {
 		}
 		http.ServeFile(w, r, filepath.Join(staticPath, "index.html"))
 	})
+
+	// Контекст для контроля жизненного цикла горутин
+	rootCtx, cancelRootCtx := context.WithCancel(context.Background())
+	defer cancelRootCtx()
 
 	token := os.Getenv("TELEGRAM_TOKEN")
 	
@@ -203,8 +239,40 @@ func main() {
 		})
 	}
 
-	go startNotificationWorker()
+	// Запуск воркера с контекстом отмены
+	startNotificationWorker(rootCtx)
 
-	log.Println("Сервер запущен на :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	// Настройка HTTP-сервера для Graceful Shutdown
+	srv := &http.Server{
+		Addr:    ":8080",
+		Handler: nil,
+	}
+
+	go func() {
+		slog.Info("Сервер успешно запущен на порту :8080")
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("Критическая ошибка HTTP-сервера", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	// Ожидаем системных сигналов завершения
+	stopSignal := make(chan os.Signal, 1)
+	signal.Notify(stopSignal, os.Interrupt, syscall.SIGTERM)
+	<-stopSignal
+
+	slog.Info("Получен сигнал завершения. Начинаем Graceful Shutdown...")
+	
+	// 1. Останавливаем фоновые воркеры
+	cancelRootCtx()
+
+	// 2. Даем серверу 5 секунд на завершение текущих сетевых запросов
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelShutdown()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Error("Ошибка при принудительной остановке HTTP-сервера", "err", err)
+	} else {
+		slog.Info("HTTP-сервер штатно остановил работу")
+	}
 }
