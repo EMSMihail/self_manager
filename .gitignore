@@ -1,0 +1,16 @@
+node_modules/
+.svelte-kit/
+build/
+
+
+backend/server
+*.db
+*.db-journal
+
+data/
+
+.vscode/
+.idea/
+.DS_Store
+
+.env

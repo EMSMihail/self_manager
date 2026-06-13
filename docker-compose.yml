@@ -1,0 +1,15 @@
+services:
+  app:
+    env_file:
+      - ./backend/.env
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: self_manager
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - TZ=Europe/Moscow
+    restart: unless-stopped
