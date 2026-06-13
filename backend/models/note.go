@@ -9,4 +9,5 @@ type Note struct {
 	Deadline  *time.Time `json:"deadline"`
     Notified  bool      `json:"notified"`
 	Status    string     `json:"status"`
+	Priority  string     `json:"priority"`
 }
