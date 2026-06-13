@@ -13,10 +13,16 @@ export async function sendNoteToBackend(note) {
     return res.ok;
 }
 
-export async function updateNoteStatusInBackend(id, status) {
+export async function updateNoteInBackend(note) {
     const res = await fetch('/api/notes', {
         method: 'PUT',
-        body: JSON.stringify({ id, status }),
+        body: JSON.stringify({ 
+            id: note.id, 
+            content: note.content, 
+            deadline: note.deadline, 
+            status: note.status,
+            notified: note.notified ? true : false // Приведение к boolean для Go
+        }),
         headers: { 'Content-Type': 'application/json' }
     });
     return res.ok;

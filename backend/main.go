@@ -59,15 +59,18 @@ func notesHandler(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodPut:
 		var updateData struct {
-			ID     int    `json:"id"`
-			Status string `json:"status"`
+			ID       int    `json:"id"`
+			Content  string `json:"content"`
+			Deadline string `json:"deadline"`
+			Status   string `json:"status"`
+			Notified bool   `json:"notified"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&updateData); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		
-		if err := db.UpdateNoteStatus(updateData.ID, updateData.Status); err != nil {
+		if err := db.UpdateNote(updateData.ID, updateData.Content, updateData.Deadline, updateData.Status, updateData.Notified); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}

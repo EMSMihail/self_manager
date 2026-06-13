@@ -72,7 +72,11 @@ func GetAllNotes() ([]models.Note, error) {
     return notes, nil
 }
 
-func UpdateNoteStatus(id int, status string) error {
-	_, err := DB.Exec("UPDATE notes SET status = ? WHERE id = ?", status, id)
+func UpdateNote(id int, content string, deadline string, status string, notified bool) error {
+	if deadline == "" {
+		_, err := DB.Exec("UPDATE notes SET content = ?, deadline = NULL, status = ?, notified = ? WHERE id = ?", content, status, notified, id)
+		return err
+	}
+	_, err := DB.Exec("UPDATE notes SET content = ?, deadline = ?, status = ?, notified = ? WHERE id = ?", content, deadline, status, notified, id)
 	return err
 }
