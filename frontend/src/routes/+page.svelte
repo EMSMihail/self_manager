@@ -24,9 +24,29 @@
   let modalDeadlineValue = "";
 
   // Переменные управления сортировкой и фильтрацией
-  let filterPriority = "all"; // "all", "low", "medium", "high"
+  let filterPriority = "all";
   let filterUrgent = false;   // true / false
-  let sortBy = "none";        // "none", "priority", "deadline"
+  let sortBy = "none";
+
+  // Переменные кастомизации
+  let currentTheme = "default";
+  let currentCardStyle = "style-default";
+
+  // Запускаем реактивность только в браузере (клиентский апдейт)
+  $: if (currentTheme && typeof document !== 'undefined') {
+    updateThemeClasses();
+  }
+  $: if (currentCardStyle && typeof localStorage !== 'undefined') {
+    localStorage.setItem('sm-card-style', currentCardStyle);
+  }
+
+  function updateThemeClasses() {
+    if (typeof document !== 'undefined') {
+      document.body.className = ''; // Сбрасываем старые темы с тега body
+      document.body.classList.add(`theme-${currentTheme}`);
+      localStorage.setItem('sm-theme', currentTheme);
+    }
+  }
 
   // Структура Kanban-доски
   let columns = [
@@ -40,13 +60,14 @@
       const serverNotes = await fetchNotesFromBackend();
       const localNotes = await db.notes.toArray();
       const localDirtyIds = new Set(localNotes.filter(n => n.isSynced === 0).map(n => n.id));
+      
       const notesToUpsert = serverNotes.filter(sn => !localDirtyIds.has(sn.id));
       
       for (const note of notesToUpsert) {
         await db.notes.put({
           id: note.id,
           content: note.content,
-          description: note.description || '',
+          description: note.description || '', 
           deadline: note.deadline ? new Date(note.deadline).toISOString() : null,
           notified: note.notified ? 1 : 0,
           status: note.status || 'todo',
@@ -73,13 +94,12 @@
   async function refreshBoardFromIndexedDB() {
     const allLocal = await db.notes.toArray();
     const weights = { high: 3, medium: 2, low: 1 };
-
+    
     columns = columns.map(col => {
       let items = allLocal
         .filter(n => n.status === col.id)
-        .map(n => ({ ...n, id: String(n.id) })); // dnd-zone требует строковые ID
+        .map(n => ({ ...n, id: String(n.id) }));
 
-      // Применяем сортировку, если выбран режим
       if (sortBy === 'priority') {
         items.sort((a, b) => (weights[b.priority] || 0) - (weights[a.priority] || 0));
       } else if (sortBy === 'deadline') {
@@ -94,18 +114,21 @@
     });
   }
 
-  // Функция проверки видимости карточки (передаем реактивные переменные аргументами)
   function isCardVisible(item, currentPriorityFilter, currentUrgentFilter) {
     if (currentPriorityFilter !== "all" && item.priority !== currentPriorityFilter) return false;
     if (currentUrgentFilter) {
       if (!item.deadline) return false;
       const todayStr = new Date().toISOString().split('T')[0];
-      return item.deadline.split('T')[0] <= todayStr; // Проверяем, если дедлайн сегодня или просрочен
+      return item.deadline.split('T')[0] <= todayStr;
     }
     return true;
   }
 
   onMount(async () => {
+    // Загрузка сохраненных настроек стилей
+    currentTheme = localStorage.getItem('sm-theme') || 'default';
+    currentCardStyle = localStorage.getItem('sm-card-style') || 'style-default';
+    
     await syncAndLoad();
     setInterval(syncAndLoad, 15000);
   });
@@ -125,14 +148,12 @@
       isSynced: 0
     };
 
-    // Быстро отображаем карточку в UI с временным ID
     await db.notes.put({ ...noteData, id: localId });
     newNote = "";
     newDescription = "";
     newPriority = "low";
     await refreshBoardFromIndexedDB();
 
-    // Отправляем на бэкенд
     const result = await sendNoteToBackend({ 
       content: noteData.content, 
       description: noteData.description,
@@ -151,7 +172,6 @@
     }
   }
 
-  // Быстрая кнопка колокольчика (+1 час дедлайна)
   async function addHourReminder(item) {
     const oneHourLater = new Date(Date.now() + 60 * 60 * 1000).toISOString();
     await db.notes.update(Number(item.id), {
@@ -168,7 +188,6 @@
     }
   }
 
-  // Хэндлеры для Drag and Drop
   function handleDndConsider(columnId, e) {
     const colIdx = columns.findIndex(c => c.id === columnId);
     columns[colIdx].items = e.detail.items;
@@ -183,10 +202,10 @@
     const triggeredItem = e.detail.info?.id 
       ? e.detail.items.find(i => i.id === e.detail.info.id)
       : null;
+
     if (triggeredItem) {
       const numericId = Number(triggeredItem.id);
       const originalNote = await db.notes.get(numericId);
-      
       if (columnId === 'in_progress' && originalNote.status === 'todo') {
         modalNote = triggeredItem;
         modalDeadlineValue = "";
@@ -214,7 +233,6 @@
     }
   }
 
-  // Сохранение дедлайна из модалки
   async function saveModalDeadline() {
     if (!modalNote) return;
     const numericId = Number(modalNote.id);
@@ -235,7 +253,6 @@
     }
   }
 
-  // Пропуск дедлайна в модалке
   async function skipModalDeadline() {
     if (!modalNote) return;
     const numericId = Number(modalNote.id);
@@ -261,7 +278,6 @@
     modalDeadlineValue = "";
   }
 
-  // Удаление карточки
   async function deleteCard(id) {
     const numericId = Number(id);
     await db.notes.delete(numericId);
@@ -274,7 +290,6 @@
     }
   }
 
-  // Редактирование текста напрямую
   function startEdit(item) {
     editingId = item.id;
     editContent = item.content;
@@ -362,10 +377,30 @@
       </select>
     </div>
 
+    <div class="filter-group">
+      <label for="theme-select">🎨 Тема:</label>
+      <select id="theme-select" bind:value={currentTheme}>
+        <option value="default">🌌 Слейт</option>
+        <option value="fantasy">📜 Тёмное фэнтези</option>
+        <option value="cyberpunk">🔮 Киберпанк</option>
+        <option value="matrix">📟 Матрица</option>
+      </select>
+    </div>
+
+    <div class="filter-group">
+      <label for="style-select">🃏 Карточки:</label>
+      <select id="style-select" bind:value={currentCardStyle}>
+        <option value="style-default">Стандартные</option>
+        <option value="style-neon">Неоновые</option>
+        <option value="style-glass">Стекло</option>
+        <option value="style-minimal">Минимализм</option>
+      </select>
+    </div>
+
     <div class="filter-group checkbox-group">
       <label>
         <input type="checkbox" bind:checked={filterUrgent}>
-        🔥 Только горящие (сегодня / просрочено)
+        🔥 Только горящие
       </label>
     </div>
   </div>
@@ -387,7 +422,7 @@
           {#each column.items as item (item.id)}
             <div 
               animate:flip={{ duration: flipDurationMs }} 
-              class="card priority-{item.priority} {isCardVisible(item, filterPriority, filterUrgent) ? '' : 'hidden-card'}"
+              class="card priority-{item.priority} {currentCardStyle} {isCardVisible(item, filterPriority, filterUrgent) ? '' : 'hidden-card'}"
             >
               {#if editingId === item.id}
                 <div class="edit-mode">
@@ -461,8 +496,23 @@
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     background-color: #0f172a;
     color: #f8fafc;
-
     color-scheme: dark;
+    transition: background-color 0.3s ease, color 0.3s ease;
+  }
+
+  /* ГЛОБАЛЬНЫЕ СТИЛИ ТЕМ (ПРИВЯЗАНЫ К КЛАССАМ НА BODY) */
+  :global(body.theme-fantasy) {
+    background-color: #120e0b !important;
+    color: #e5d5c5;
+  }
+  :global(body.theme-cyberpunk) {
+    background-color: #0c0214 !important;
+    color: #00ffcc;
+  }
+  :global(body.theme-matrix) {
+    background-color: #000000 !important;
+    color: #00ff00;
+    font-family: 'Courier New', monospace !important;
   }
 
   .app-container {
@@ -486,7 +536,7 @@
     font-weight: 800;
     letter-spacing: -0.5px;
   }
-  .logo span { color: #6366f1; }
+  .logo span { color: #6366f1; transition: color 0.3s; }
   .status-indicator {
     font-size: 12px;
     color: #10b981;
@@ -503,6 +553,7 @@
     border: 1px solid #334155;
     margin-bottom: 20px;
     box-shadow: 0 4px 6px -1px rgba(0,0,0,0.2);
+    transition: background 0.3s, border-color 0.3s;
   }
   .input-wrapper {
     display: flex;
@@ -518,7 +569,7 @@
     color: white;
     font-size: 14px;
     outline: none;
-    transition: border 0.2s;
+    transition: border 0.2s, background 0.3s;
   }
   .input-wrapper input:focus { border-color: #6366f1; }
   
@@ -529,6 +580,7 @@
     border: 1px solid #475569;
     border-radius: 8px;
     cursor: pointer;
+    transition: background 0.3s;
   }
 
   .add-button {
@@ -543,9 +595,7 @@
   }
   .add-button:hover { background: #4338ca; }
 
-  .description-wrapper {
-    margin-top: 12px;
-  }
+  .description-wrapper { margin-top: 12px; }
   .creation-description {
     width: 100%;
     background: #0f172a;
@@ -557,11 +607,9 @@
     outline: none;
     resize: vertical;
     box-sizing: border-box;
-    transition: border 0.2s;
+    transition: border 0.2s, background 0.3s;
   }
-  .creation-description:focus {
-    border-color: #6366f1;
-  }
+  .creation-description:focus { border-color: #6366f1; }
 
   /* Панель сортировки и фильтрации */
   .toolbar {
@@ -575,6 +623,7 @@
     align-items: center;
     flex-wrap: wrap;
     box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
+    transition: background 0.3s, border-color 0.3s;
   }
   .filter-group {
     display: flex;
@@ -591,6 +640,7 @@
     border-radius: 6px;
     outline: none;
     cursor: pointer;
+    transition: background 0.3s, border-color 0.3s;
   }
   .checkbox-group label {
     display: flex;
@@ -600,9 +650,7 @@
     color: #f43f5e;
     font-weight: 500;
   }
-  .hidden-card {
-    display: none !important;
-  }
+  .hidden-card { display: none !important; }
 
   /* Сетка Kanban */
   .kanban-board {
@@ -620,6 +668,7 @@
     min-height: 500px;
     display: flex;
     flex-direction: column;
+    transition: background 0.3s, border-color 0.3s;
   }
 
   .column-header {
@@ -643,7 +692,6 @@
     font-size: 12px;
     color: #94a3b8;
   }
-
   .column-body {
     flex: 1;
     min-height: 450px;
@@ -652,36 +700,26 @@
     gap: 10px;
   }
 
-  /* Карточки задач */
+  /* Базовый стиль карточек задач */
   .card {
     background: #273549;
     border-left: 4px solid #94a3b8;
     border-radius: 8px;
     padding: 14px;
     box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    transition: transform 0.15s, box-shadow 0.15s;
+    transition: transform 0.15s, box-shadow 0.3s, background 0.3s, border 0.3s;
   }
   .card:hover {
     transform: translateY(-2px);
-    box-shadow: 0 4px 12px rgba(0,0,0,0.25);
   }
 
-  /* Градации приоритетов */
+  /* Градации приоритетов по умолчанию */
   .card.priority-high { border-left-color: #ef4444; }
   .card.priority-medium { border-left-color: #eab308; }
   .card.priority-low { border-left-color: #10b981; }
 
-  .card-layout {
-    display: flex;
-    justify-content: space-between;
-    gap: 12px;
-  }
-  .card-main {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    flex: 1;
-  }
+  .card-layout { display: flex; justify-content: space-between; gap: 12px; }
+  .card-main { display: flex; flex-direction: column; gap: 4px; flex: 1; }
   .card-text {
     margin: 0;
     font-size: 14px;
@@ -695,7 +733,7 @@
     font-size: 12px;
     line-height: 1.5;
     color: #94a3b8;
-    white-space: pre-wrap; /* Чтобы сохранялись переносы строк */
+    white-space: pre-wrap;
     word-break: break-word;
   }
   .card-deadline {
@@ -707,13 +745,7 @@
     width: fit-content;
     margin-top: 4px;
   }
-
-  .card-controls {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    justify-content: flex-start;
-  }
+  .card-controls { display: flex; flex-direction: column; gap: 4px; justify-content: flex-start; }
   .action-btn {
     background: transparent;
     border: none;
@@ -725,13 +757,8 @@
   }
   .action-btn:hover { background: rgba(255,255,255,0.1); }
 
-  /* Режим редактирования внутри карточки */
-  .edit-mode {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    width: 100%;
-  }
+  /* Режим редактирования */
+  .edit-mode { display: flex; flex-direction: column; gap: 8px; width: 100%; }
   .edit-mode textarea {
     background: #0f172a;
     color: white;
@@ -740,14 +767,9 @@
     padding: 8px;
     font-size: 13px;
     outline: none;
-  }
-  .edit-mode textarea {
     resize: vertical;
   }
-  .edit-row {
-    display: flex;
-    gap: 6px;
-  }
+  .edit-row { display: flex; gap: 6px; }
   .edit-row input, .edit-row select {
     background: #0f172a;
     color: white;
@@ -759,10 +781,7 @@
     outline: none;
     color-scheme: dark;
   }
-  .edit-actions {
-    display: flex;
-    gap: 6px;
-  }
+  .edit-actions { display: flex; gap: 6px; }
   .edit-actions button {
     flex: 1;
     padding: 8px;
@@ -778,15 +797,10 @@
   /* Модальное окно */
   .modal-backdrop {
     position: fixed;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
+    top: 0; left: 0; width: 100%; height: 100%;
     background: rgba(15, 23, 42, 0.8);
     backdrop-filter: blur(4px);
-    display: flex;
-    justify-content: center;
-    align-items: center;
+    display: flex; justify-content: center; align-items: center;
     z-index: 999;
   }
   .modal-window {
@@ -811,18 +825,101 @@
     box-sizing: border-box;
     color-scheme: dark;
   }
-  .modal-buttons {
-    display: flex;
-    gap: 12px;
-  }
-  .modal-buttons button {
-    flex: 1;
-    padding: 10px;
-    border: none;
-    border-radius: 6px;
-    font-weight: 600;
-    cursor: pointer;
-  }
+  .modal-buttons { display: flex; gap: 12px; }
+  .modal-buttons button { flex: 1; padding: 10px; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; }
   .btn-accent { background: #4f46e5; color: white; }
   .btn-secondary { background: #334155; color: #cbd5e1; }
+
+
+  /* ==========================================================================
+     СПЕЦИФИЧЕСКИЕ СТИЛИ ДЛЯ ТЕМ И ОФОРМЛЕНИЯ КАРТОЧЕК
+     ========================================================================== */
+
+  /* --- ТЕМА: ТЁМНОЕ ФЭНТЕЗИ --- */
+  :global(.theme-fantasy) .creation-panel,
+  :global(.theme-fantasy) .toolbar,
+  :global(.theme-fantasy) .kanban-column,
+  :global(.theme-fantasy) .modal-window {
+    background: #1b1511;
+    border-color: #423429;
+  }
+  :global(.theme-fantasy) .card { background: #28201a; }
+  :global(.theme-fantasy) .logo span { color: #cfa86b; }
+  :global(.theme-fantasy) .add-button { background: #876843; }
+  :global(.theme-fantasy) .add-button:hover { background: #6c5234; }
+  :global(.theme-fantasy) input, :global(.theme-fantasy) select, :global(.theme-fantasy) textarea {
+    background: #100d0a; border-color: #423429; color: #e5d5c5;
+  }
+
+  /* --- ТЕМА: КИБЕРПАНК --- */
+  :global(.theme-cyberpunk) .creation-panel,
+  :global(.theme-cyberpunk) .toolbar,
+  :global(.theme-cyberpunk) .kanban-column,
+  :global(.theme-cyberpunk) .modal-window {
+    background: #150224;
+    border-color: #ff007f;
+    box-shadow: 0 0 10px rgba(255, 0, 127, 0.15);
+  }
+  :global(.theme-cyberpunk) .card { background: #24053d; }
+  :global(.theme-cyberpunk) .logo span { color: #ff007f; text-shadow: 0 0 5px #ff007f; }
+  :global(.theme-cyberpunk) .add-button { background: #ff007f; color: white; font-weight: bold; }
+  :global(.theme-cyberpunk) .add-button:hover { background: #cc0065; }
+  :global(.theme-cyberpunk) input, :global(.theme-cyberpunk) select, :global(.theme-cyberpunk) textarea {
+    background: #090112; border-color: #ff007f; color: #00ffcc;
+  }
+
+  /* --- ТЕМА: МАТРИЦА --- */
+  :global(.theme-matrix) .creation-panel,
+  :global(.theme-matrix) .toolbar,
+  :global(.theme-matrix) .kanban-column,
+  :global(.theme-matrix) .modal-window {
+    background: #050505;
+    border-color: #00ff00;
+  }
+  :global(.theme-matrix) .card { background: #000000; border: 1px solid #005500; }
+  :global(.theme-matrix) .logo span { color: #00ff00; }
+  :global(.theme-matrix) .add-button { background: #00aa00; color: black; font-weight: bold; }
+  :global(.theme-matrix) .add-button:hover { background: #008800; }
+  :global(.theme-matrix) input, :global(.theme-matrix) select, :global(.theme-matrix) textarea {
+    background: #000000; border-color: #00ff00; color: #00ff00; font-family: 'Courier New', monospace;
+  }
+  :global(.theme-matrix) .card-text, :global(.theme-matrix) .card-description { color: #00ff00; }
+
+
+  /* --- СТИЛЬ КАРТОЧЕК: НЕОН --- */
+  .card.style-neon {
+    box-shadow: 0 0 8px rgba(148, 163, 184, 0.1);
+  }
+  .card.style-neon.priority-high {
+    box-shadow: 0 0 14px rgba(239, 68, 68, 0.4);
+    background: rgba(239, 68, 68, 0.04);
+    border: 1px solid #ef4444;
+  }
+  .card.style-neon.priority-medium {
+    box-shadow: 0 0 14px rgba(234, 179, 8, 0.4);
+    background: rgba(234, 179, 8, 0.04);
+    border: 1px solid #eab308;
+  }
+  .card.style-neon.priority-low {
+    box-shadow: 0 0 14px rgba(16, 185, 129, 0.4);
+    background: rgba(16, 185, 129, 0.04);
+    border: 1px solid #10b981;
+  }
+
+  /* --- СТИЛЬ КАРТОЧЕК: МАТОВОЕ СТЕКЛО --- */
+  .card.style-glass {
+    background: rgba(255, 255, 255, 0.03) !important;
+    backdrop-filter: blur(12px) saturate(160%);
+    -webkit-backdrop-filter: blur(12px) saturate(160%);
+    border: 1px solid rgba(255, 255, 255, 0.08) !important;
+    box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.2);
+  }
+
+  /* --- СТИЛЬ КАРТОЧЕК: МИНИМАЛИЗМ --- */
+  .card.style-minimal {
+    background: transparent !important;
+    border: 1px solid #334155 !important;
+    box-shadow: none !important;
+    border-radius: 4px;
+  }
 </style>
