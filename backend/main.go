@@ -32,7 +32,8 @@ func notesHandler(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodPost:
         var n struct { 
-            Content  string `json:"content"` 
+            Content  string `json:"content"`
+			Description string `json:"description"`
             Deadline string `json:"deadline"` 
             Priority string `json:"priority"`
         }
@@ -42,7 +43,7 @@ func notesHandler(w http.ResponseWriter, r *http.Request) {
             return
         }
         
-        insertedID, err := db.AddNote(n.Content, n.Deadline, n.Priority)
+		insertedID, err := db.AddNote(n.Content, n.Description, n.Deadline, n.Priority)
         if err != nil {
             slog.Error("Ошибка добавления заметки в БД", "err", err, "content", n.Content)
             http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -72,12 +73,13 @@ func notesHandler(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodPut:
 		var updateData struct {
-			ID       int    `json:"id"`
-			Content  string `json:"content"`
-			Deadline string `json:"deadline"`
-			Status   string `json:"status"`
-			Notified bool   `json:"notified"`
-			Priority string `json:"priority"`
+			ID          int    `json:"id"`
+			Content     string `json:"content"`
+			Description string `json:"description"`
+			Deadline    string `json:"deadline"`
+			Status      string `json:"status"`
+			Notified    bool   `json:"notified"`
+			Priority    string `json:"priority"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&updateData); err != nil {
 			slog.Warn("Ошибка декодирования PUT body", "err", err)
@@ -85,7 +87,7 @@ func notesHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		
-		if err := db.UpdateNote(updateData.ID, updateData.Content, updateData.Deadline, updateData.Status, updateData.Notified, updateData.Priority); err != nil {
+		if err := db.UpdateNote(updateData.ID, updateData.Content, updateData.Description, updateData.Deadline, updateData.Status, updateData.Notified, updateData.Priority); err != nil {
 			slog.Error("Ошибка обновления заметки", "err", err, "id", updateData.ID)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -220,8 +222,8 @@ func main() {
 				if note.Deadline != nil {
 					deadlineStr = note.Deadline.Format(time.RFC3339)
 				}
-				// Перемещаем в колонку "done" и оставляем notified = true
-				db.UpdateNote(note.ID, note.Content, deadlineStr, "done", true, note.Priority)
+
+				db.UpdateNote(note.ID, note.Content, note.Description, deadlineStr, "done", true, note.Priority)
 				textStatus = "✅ Выполнено"
 				
 			} else if action == "postpone" {
@@ -229,8 +231,8 @@ func main() {
 				loc, _ := time.LoadLocation("Europe/Moscow")
 				newDeadline := time.Now().In(loc).Add(1 * time.Hour).Format(time.RFC3339)
 				
-				// Статус оставляем прежним, но сбрасываем notified на false, чтобы воркер сработал опять
-				db.UpdateNote(note.ID, note.Content, newDeadline, note.Status, false, note.Priority)
+
+				db.UpdateNote(note.ID, note.Content, note.Description, newDeadline, note.Status, false, note.Priority)
 				textStatus = "⏰ Отложено на 1 час"
 			}
 

@@ -21,6 +21,7 @@ func InitDB(filepath string) error {
 	CREATE TABLE IF NOT EXISTS notes (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		content TEXT NOT NULL,
+		description TEXT DEFAULT '',
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		deadline DATETIME,
     	notified BOOLEAN DEFAULT 0,
@@ -29,11 +30,18 @@ func InitDB(filepath string) error {
 	);`
 	
 	_, err = DB.Exec(query)
-
+	if err != nil {
 	return err
 }
 
-func AddNote(content string, deadline string, priority string) (int64, error) {
+	// Миграция для существующей базы: добавляем колонку, если её не было.
+	// Ошибку игнорируем, так как если колонка уже есть, SQLite выдаст ошибку "duplicate column name"
+	_, _ = DB.Exec("ALTER TABLE notes ADD COLUMN description TEXT DEFAULT '';")
+
+	return nil
+}
+
+func AddNote(content string, description string, deadline string, priority string) (int64, error) {
     if priority == "" {
         priority = "low"
     }
@@ -42,9 +50,9 @@ func AddNote(content string, deadline string, priority string) (int64, error) {
     var err error
 
     if deadline == "" {
-        res, err = DB.Exec("INSERT INTO notes (content, priority) VALUES (?, ?)", content, priority)
+		res, err = DB.Exec("INSERT INTO notes (content, description, priority) VALUES (?, ?, ?)", content, description, priority)
     } else {
-        res, err = DB.Exec("INSERT INTO notes (content, deadline, priority) VALUES (?, ?, ?)", content, deadline, priority)
+		res, err = DB.Exec("INSERT INTO notes (content, description, deadline, priority) VALUES (?, ?, ?, ?)", content, description, deadline, priority)
     }
 
     if err != nil {
@@ -61,7 +69,7 @@ func DeleteNote(id int) error {
 }
 
 func GetAllNotes() ([]models.Note, error) {
-	rows, err := DB.Query("SELECT id, content, created_at, deadline, notified, status, priority FROM notes ORDER BY created_at DESC")
+	rows, err := DB.Query("SELECT id, content, description, created_at, deadline, notified, status, priority FROM notes ORDER BY created_at DESC")
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +79,7 @@ func GetAllNotes() ([]models.Note, error) {
 	for rows.Next() {
 		var n models.Note
 		var deadline sql.NullTime
-		err := rows.Scan(&n.ID, &n.Content, &n.CreatedAt, &deadline, &n.Notified, &n.Status, &n.Priority)
+		err := rows.Scan(&n.ID, &n.Content, &n.Description, &n.CreatedAt, &deadline, &n.Notified, &n.Status, &n.Priority)
 		if err != nil {
 			return nil, err
 		}
@@ -83,15 +91,15 @@ func GetAllNotes() ([]models.Note, error) {
 	return notes, nil
 }
 
-func UpdateNote(id int, content string, deadline string, status string, notified bool, priority string) error {
+func UpdateNote(id int, content string, description string, deadline string, status string, notified bool, priority string) error {
 	if priority == "" {
 		priority = "low"
 	}
 	if deadline == "" {
-		_, err := DB.Exec("UPDATE notes SET content = ?, deadline = NULL, status = ?, notified = ?, priority = ? WHERE id = ?", content, status, notified, priority, id)
+		_, err := DB.Exec("UPDATE notes SET content = ?, description = ?, deadline = NULL, status = ?, notified = ?, priority = ? WHERE id = ?", content, description, status, notified, priority, id)
 		return err
 	}
-	_, err := DB.Exec("UPDATE notes SET content = ?, deadline = ?, status = ?, notified = ?, priority = ? WHERE id = ?", content, deadline, status, notified, priority, id)
+	_, err := DB.Exec("UPDATE notes SET content = ?, description = ?, deadline = ?, status = ?, notified = ?, priority = ? WHERE id = ?", content, description, deadline, status, notified, priority, id)
 	return err
 }
 
@@ -99,8 +107,8 @@ func GetNoteByID(id int) (models.Note, error) {
 	var n models.Note
 	var deadline sql.NullTime
 	
-	err := DB.QueryRow("SELECT id, content, created_at, deadline, notified, status, priority FROM notes WHERE id = ?", id).
-		Scan(&n.ID, &n.Content, &n.CreatedAt, &deadline, &n.Notified, &n.Status, &n.Priority)
+	err := DB.QueryRow("SELECT id, content, description, created_at, deadline, notified, status, priority FROM notes WHERE id = ?", id).
+		Scan(&n.ID, &n.Content, &n.Description, &n.CreatedAt, &deadline, &n.Notified, &n.Status, &n.Priority)
 		
 	if deadline.Valid {
 		n.Deadline = &deadline.Time

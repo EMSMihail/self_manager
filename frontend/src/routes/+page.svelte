@@ -6,15 +6,15 @@
   import { fetchNotesFromBackend, sendNoteToBackend, updateNoteInBackend } from '$lib/api';
 
   const flipDurationMs = 200;
-  
-  // 1. Дефолтный приоритет теперь "low"
   let newNote = "";
+  let newDescription = "";
   let deadline = "";
-  let newPriority = "low"; 
+  let newPriority = "low";
 
   // Переменные для режима редактирования
   let editingId = null;
   let editContent = "";
+  let editDescription = "";
   let editDeadline = "";
   let editPriority = "low";
 
@@ -22,6 +22,11 @@
   let showDeadlineModal = false;
   let modalNote = null;
   let modalDeadlineValue = "";
+
+  // Переменные управления сортировкой и фильтрацией
+  let filterPriority = "all"; // "all", "low", "medium", "high"
+  let filterUrgent = false;   // true / false
+  let sortBy = "none";        // "none", "priority", "deadline"
 
   // Структура Kanban-доски
   let columns = [
@@ -35,13 +40,13 @@
       const serverNotes = await fetchNotesFromBackend();
       const localNotes = await db.notes.toArray();
       const localDirtyIds = new Set(localNotes.filter(n => n.isSynced === 0).map(n => n.id));
-
       const notesToUpsert = serverNotes.filter(sn => !localDirtyIds.has(sn.id));
       
       for (const note of notesToUpsert) {
         await db.notes.put({
           id: note.id,
           content: note.content,
+          description: note.description || '',
           deadline: note.deadline ? new Date(note.deadline).toISOString() : null,
           notified: note.notified ? 1 : 0,
           status: note.status || 'todo',
@@ -50,6 +55,14 @@
           isSynced: 1
         });
       }
+
+      const serverIds = new Set(serverNotes.map(sn => sn.id));
+      for (const localNote of localNotes) {
+        if (localNote.isSynced === 1 && !serverIds.has(localNote.id)) {
+          await db.notes.delete(localNote.id);
+        }
+      }
+
       await refreshBoardFromIndexedDB();
     } catch (err) {
       console.warn("Работаем в офлайн-режиме:", err);
@@ -59,12 +72,37 @@
 
   async function refreshBoardFromIndexedDB() {
     const allLocal = await db.notes.toArray();
+    const weights = { high: 3, medium: 2, low: 1 };
+
     columns = columns.map(col => {
-      const items = allLocal
+      let items = allLocal
         .filter(n => n.status === col.id)
         .map(n => ({ ...n, id: String(n.id) })); // dnd-zone требует строковые ID
+
+      // Применяем сортировку, если выбран режим
+      if (sortBy === 'priority') {
+        items.sort((a, b) => (weights[b.priority] || 0) - (weights[a.priority] || 0));
+      } else if (sortBy === 'deadline') {
+        items.sort((a, b) => {
+          if (!a.deadline) return 1;
+          if (!b.deadline) return -1;
+          return a.deadline.localeCompare(b.deadline);
+        });
+      }
+
       return { ...col, items };
     });
+  }
+
+  // Функция проверки видимости карточки (передаем реактивные переменные аргументами)
+  function isCardVisible(item, currentPriorityFilter, currentUrgentFilter) {
+    if (currentPriorityFilter !== "all" && item.priority !== currentPriorityFilter) return false;
+    if (currentUrgentFilter) {
+      if (!item.deadline) return false;
+      const todayStr = new Date().toISOString().split('T')[0];
+      return item.deadline.split('T')[0] <= todayStr; // Проверяем, если дедлайн сегодня или просрочен
+    }
+    return true;
   }
 
   onMount(async () => {
@@ -72,11 +110,13 @@
     setInterval(syncAndLoad, 15000);
   });
 
+  // Добавление новой карточки
   async function addNote() {
     if (!newNote.trim()) return;
     const localId = Date.now();
     const noteData = {
       content: newNote,
+      description: newDescription,
       deadline: null,
       status: 'todo',
       notified: 0,
@@ -84,29 +124,29 @@
       created_at: new Date().toISOString(),
       isSynced: 0
     };
+
+    // Быстро отображаем карточку в UI с временным ID
     await db.notes.put({ ...noteData, id: localId });
     newNote = "";
+    newDescription = "";
     newPriority = "low";
     await refreshBoardFromIndexedDB();
 
-    // Получаем данные ответа (включая настоящий ID)
-    const resData = await sendNoteToBackend({ 
+    // Отправляем на бэкенд
+    const result = await sendNoteToBackend({ 
       content: noteData.content, 
+      description: noteData.description,
       deadline: "", 
       priority: noteData.priority 
     });
-    
-    if (resData && resData.id) {
-      // ИСПРАВЛЕНИЕ: Удаляем временный локальный ID из IndexedDB
+
+    if (result && result.id) {
       await db.notes.delete(localId);
-      
-      // Записываем ту же задачу, но связываем её с системным ID бэкенда
       await db.notes.put({
         ...noteData,
-        id: resData.id,
+        id: result.id,
         isSynced: 1
       });
-      
       await syncAndLoad();
     }
   }
@@ -114,8 +154,6 @@
   // Быстрая кнопка колокольчика (+1 час дедлайна)
   async function addHourReminder(item) {
     const oneHourLater = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-    
-    // Обновляем локально
     await db.notes.update(Number(item.id), {
       deadline: oneHourLater,
       notified: 0,
@@ -123,7 +161,6 @@
     });
     await refreshBoardFromIndexedDB();
 
-    // Отправляем на сервер
     const updatedNote = await db.notes.get(Number(item.id));
     const success = await updateNoteInBackend(updatedNote);
     if (success) {
@@ -146,12 +183,10 @@
     const triggeredItem = e.detail.info?.id 
       ? e.detail.items.find(i => i.id === e.detail.info.id)
       : null;
-
     if (triggeredItem) {
       const numericId = Number(triggeredItem.id);
       const originalNote = await db.notes.get(numericId);
-
-      // Сценарий 1: Перенос из todo в in_progress -> Запрос дедлайна
+      
       if (columnId === 'in_progress' && originalNote.status === 'todo') {
         modalNote = triggeredItem;
         modalDeadlineValue = "";
@@ -159,10 +194,9 @@
         return;
       }
 
-      // Сценарий 2: Перенос в done -> дедлайн не ставится/сбрасывается
       let updatedDeadline = originalNote.deadline;
       if (columnId === 'done') {
-        updatedDeadline = null; 
+        updatedDeadline = null;
       }
 
       await db.notes.update(numericId, { 
@@ -185,14 +219,12 @@
     if (!modalNote) return;
     const numericId = Number(modalNote.id);
     const formattedDeadline = modalDeadlineValue ? new Date(modalDeadlineValue).toISOString() : null;
-
     await db.notes.update(numericId, {
       status: 'in_progress',
       deadline: formattedDeadline,
       notified: 0,
       isSynced: 0
     });
-
     closeModal();
     await refreshBoardFromIndexedDB();
 
@@ -213,7 +245,6 @@
       deadline: null,
       isSynced: 0
     });
-
     closeModal();
     await refreshBoardFromIndexedDB();
 
@@ -247,6 +278,7 @@
   function startEdit(item) {
     editingId = item.id;
     editContent = item.content;
+    editDescription = item.description || "";
     editDeadline = item.deadline ? item.deadline.slice(0, 16) : "";
     editPriority = item.priority || "low";
   }
@@ -255,6 +287,7 @@
     const numericId = Number(editingId);
     await db.notes.update(numericId, {
       content: editContent,
+      description: editDescription,
       deadline: editDeadline ? new Date(editDeadline).toISOString() : null,
       priority: editPriority,
       isSynced: 0
@@ -299,7 +332,43 @@
 
       <button on:click={addNote} class="add-button">Создать</button>
     </div>
+    <div class="description-wrapper">
+      <textarea 
+        bind:value={newDescription} 
+        placeholder="Добавить описание к задаче (необязательно)..." 
+        rows="2"
+        class="creation-description"
+      ></textarea>
+    </div>
   </section>
+
+  <div class="toolbar">
+    <div class="filter-group">
+      <label for="priority-filter">Приоритет:</label>
+      <select id="priority-filter" bind:value={filterPriority}>
+        <option value="all">Все</option>
+        <option value="low">🟢 Низкий</option>
+        <option value="medium">🟡 Средний</option>
+        <option value="high">🔴 Высокий</option>
+      </select>
+    </div>
+
+    <div class="filter-group">
+      <label for="sort-select">Сортировка:</label>
+      <select id="sort-select" bind:value={sortBy} on:change={refreshBoardFromIndexedDB}>
+        <option value="none">По порядку</option>
+        <option value="priority">По приоритету (Важные сверху)</option>
+        <option value="deadline">По дедлайну (Срочные сверху)</option>
+      </select>
+    </div>
+
+    <div class="filter-group checkbox-group">
+      <label>
+        <input type="checkbox" bind:checked={filterUrgent}>
+        🔥 Только горящие (сегодня / просрочено)
+      </label>
+    </div>
+  </div>
 
   <div class="kanban-board">
     {#each columns as column (column.id)}
@@ -316,10 +385,14 @@
           on:finalize={(e) => handleDndFinalize(column.id, e)}
         >
           {#each column.items as item (item.id)}
-            <div animate:flip={{ duration: flipDurationMs }} class="card priority-{item.priority}">
+            <div 
+              animate:flip={{ duration: flipDurationMs }} 
+              class="card priority-{item.priority} {isCardVisible(item, filterPriority, filterUrgent) ? '' : 'hidden-card'}"
+            >
               {#if editingId === item.id}
                 <div class="edit-mode">
-                  <textarea bind:value={editContent} rows="2"></textarea>
+                  <input type="text" bind:value={editContent} class="edit-title-input" placeholder="Название задачи" />
+                  <textarea bind:value={editDescription} rows="3" placeholder="Описание задачи..."></textarea>
                   <div class="edit-row">
                     <input type="datetime-local" bind:value={editDeadline} />
                     <select bind:value={editPriority}>
@@ -336,7 +409,10 @@
               {:else}
                 <div class="card-layout">
                   <div class="card-main">
-                    <p class="card-text">{item.content}</p>
+                    <h4 class="card-text">{item.content}</h4>
+                    {#if item.description}
+                      <p class="card-description">{item.description}</p>
+                    {/if}
                     {#if item.deadline}
                       <span class="card-deadline">⏰ {formatDisplayDate(item.deadline)}</span>
                     {/if}
@@ -383,7 +459,7 @@
   :global(body) {
     margin: 0;
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background-color: #0f172a; /* Глубокий slate-900 оттенок фона */
+    background-color: #0f172a;
     color: #f8fafc;
 
     color-scheme: dark;
@@ -425,7 +501,7 @@
     padding: 16px;
     border-radius: 12px;
     border: 1px solid #334155;
-    margin-bottom: 30px;
+    margin-bottom: 20px;
     box-shadow: 0 4px 6px -1px rgba(0,0,0,0.2);
   }
   .input-wrapper {
@@ -466,6 +542,67 @@
     transition: background 0.2s;
   }
   .add-button:hover { background: #4338ca; }
+
+  .description-wrapper {
+    margin-top: 12px;
+  }
+  .creation-description {
+    width: 100%;
+    background: #0f172a;
+    border: 1px solid #475569;
+    border-radius: 8px;
+    padding: 10px 14px;
+    color: white;
+    font-size: 13px;
+    outline: none;
+    resize: vertical;
+    box-sizing: border-box;
+    transition: border 0.2s;
+  }
+  .creation-description:focus {
+    border-color: #6366f1;
+  }
+
+  /* Панель сортировки и фильтрации */
+  .toolbar {
+    display: flex;
+    gap: 20px;
+    background: #1e293b;
+    padding: 12px 20px;
+    border-radius: 10px;
+    margin-bottom: 24px;
+    border: 1px solid #334155;
+    align-items: center;
+    flex-wrap: wrap;
+    box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
+  }
+  .filter-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+    color: #94a3b8;
+  }
+  .filter-group select {
+    background: #0f172a;
+    color: white;
+    border: 1px solid #475569;
+    padding: 6px 10px;
+    border-radius: 6px;
+    outline: none;
+    cursor: pointer;
+  }
+  .checkbox-group label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    color: #f43f5e;
+    font-weight: 500;
+  }
+  .hidden-card {
+    display: none !important;
+  }
 
   /* Сетка Kanban */
   .kanban-board {
@@ -542,14 +679,23 @@
   .card-main {
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 4px;
     flex: 1;
   }
   .card-text {
     margin: 0;
     font-size: 14px;
-    line-height: 1.5;
+    font-weight: 600;
+    line-height: 1.4;
     color: #f1f5f9;
+    word-break: break-word;
+  }
+  .card-description {
+    margin: 4px 0 6px 0;
+    font-size: 12px;
+    line-height: 1.5;
+    color: #94a3b8;
+    white-space: pre-wrap; /* Чтобы сохранялись переносы строк */
     word-break: break-word;
   }
   .card-deadline {
@@ -559,6 +705,7 @@
     padding: 2px 6px;
     border-radius: 4px;
     width: fit-content;
+    margin-top: 4px;
   }
 
   .card-controls {
@@ -590,9 +737,12 @@
     color: white;
     border: 1px solid #475569;
     border-radius: 6px;
-    padding: 6px;
+    padding: 8px;
     font-size: 13px;
-    resize: none;
+    outline: none;
+  }
+  .edit-mode textarea {
+    resize: vertical;
   }
   .edit-row {
     display: flex;
@@ -603,9 +753,10 @@
     color: white;
     border: 1px solid #475569;
     border-radius: 4px;
-    padding: 4px;
+    padding: 6px;
     font-size: 12px;
     flex: 1;
+    outline: none;
     color-scheme: dark;
   }
   .edit-actions {
@@ -614,7 +765,7 @@
   }
   .edit-actions button {
     flex: 1;
-    padding: 6px;
+    padding: 8px;
     border: none;
     border-radius: 4px;
     cursor: pointer;
