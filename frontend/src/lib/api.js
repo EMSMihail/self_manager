@@ -12,13 +12,14 @@ export async function fetchNotesFromBackend() {
 //     });
 //     return res.ok;
 // }
-export async function sendNoteToBackend({ content, deadline, priority = 'medium' }) {
+export async function sendNoteToBackend({ content, deadline, priority = 'low' }) {
     const res = await fetch('/api/notes', {
         method: 'POST',
         body: JSON.stringify({ content, deadline, priority }),
         headers: { 'Content-Type': 'application/json' }
     });
-    return res.ok;
+    if (!res.ok) return null;
+    return await res.json();
 }
 
 export async function updateNoteInBackend(note) {
@@ -30,7 +31,7 @@ export async function updateNoteInBackend(note) {
             deadline: note.deadline, 
             status: note.status,
             notified: note.notified ? true : false,
-            priority: note.priority || 'medium'
+            priority: note.priority || 'low'
         }),
         headers: { 'Content-Type': 'application/json' }
     });

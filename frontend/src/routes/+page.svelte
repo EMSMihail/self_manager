@@ -7,14 +7,21 @@
 
   const flipDurationMs = 200;
   
+  // 1. Дефолтный приоритет теперь "low"
   let newNote = "";
   let deadline = "";
-  let newPriority = "medium"; // Дефолтный приоритет для новой задачи
+  let newPriority = "low"; 
 
   // Переменные для режима редактирования
   let editingId = null;
   let editContent = "";
   let editDeadline = "";
+  let editPriority = "low";
+
+  // Модалка для дедлайна при перетаскивании в In Progress
+  let showDeadlineModal = false;
+  let modalNote = null;
+  let modalDeadlineValue = "";
 
   // Структура Kanban-доски
   let columns = [
@@ -23,338 +30,648 @@
     { id: 'done', name: 'Готово', items: [] }
   ];
 
-  // 1. Умная загрузка и синхронизация
   async function syncAndLoad() {
     try {
       const serverNotes = await fetchNotesFromBackend();
-      
-      // Получаем локальные заметки, чтобы проверить, нет ли неотправленных изменений
       const localNotes = await db.notes.toArray();
       const localDirtyIds = new Set(localNotes.filter(n => n.isSynced === 0).map(n => n.id));
 
-      // Фильтруем серверные заметки: обновляем в IndexedDB только то, что не редактируется локально прямо сейчас
-      const notesToUpsert = serverNotes
-        .filter(n => !localDirtyIds.has(n.id))
-        .map(n => ({ 
-          ...n, 
-          status: n.status || 'todo', 
-          priority: n.priority || 'medium', // Подтягиваем приоритет с сервера
-          isSynced: 1 
-        }));
-
-      if (notesToUpsert.length > 0) {
-        // bulkPut автоматически обновит существующие id и добавит новые
-        await db.notes.bulkPut(notesToUpsert);
-      }
+      const notesToUpsert = serverNotes.filter(sn => !localDirtyIds.has(sn.id));
       
-      // Синхронизируем удаления: если на сервере заметки нет, а у нас она числится синхронизированной — удаляем локально
-      const serverIds = new Set(serverNotes.map(n => n.id));
-      const idsToDelete = localNotes
-        .filter(n => n.isSynced === 1 && !serverIds.has(n.id))
-        .map(n => n.id);
-        
-      if (idsToDelete.length > 0) {
-        await db.notes.bulkDelete(idsToDelete);
+      for (const note of notesToUpsert) {
+        await db.notes.put({
+          id: note.id,
+          content: note.content,
+          deadline: note.deadline ? new Date(note.deadline).toISOString() : null,
+          notified: note.notified ? 1 : 0,
+          status: note.status || 'todo',
+          priority: note.priority || 'low',
+          created_at: note.created_at,
+          isSynced: 1
+        });
+      }
+      await refreshBoardFromIndexedDB();
+    } catch (err) {
+      console.warn("Работаем в офлайн-режиме:", err);
+      await refreshBoardFromIndexedDB();
+    }
+  }
+
+  async function refreshBoardFromIndexedDB() {
+    const allLocal = await db.notes.toArray();
+    columns = columns.map(col => {
+      const items = allLocal
+        .filter(n => n.status === col.id)
+        .map(n => ({ ...n, id: String(n.id) })); // dnd-zone требует строковые ID
+      return { ...col, items };
+    });
+  }
+
+  onMount(async () => {
+    await syncAndLoad();
+    setInterval(syncAndLoad, 15000);
+  });
+
+  async function addNote() {
+    if (!newNote.trim()) return;
+    const localId = Date.now();
+    const noteData = {
+      content: newNote,
+      deadline: null,
+      status: 'todo',
+      notified: 0,
+      priority: newPriority,
+      created_at: new Date().toISOString(),
+      isSynced: 0
+    };
+    await db.notes.put({ ...noteData, id: localId });
+    newNote = "";
+    newPriority = "low";
+    await refreshBoardFromIndexedDB();
+
+    // Получаем данные ответа (включая настоящий ID)
+    const resData = await sendNoteToBackend({ 
+      content: noteData.content, 
+      deadline: "", 
+      priority: noteData.priority 
+    });
+    
+    if (resData && resData.id) {
+      // ИСПРАВЛЕНИЕ: Удаляем временный локальный ID из IndexedDB
+      await db.notes.delete(localId);
+      
+      // Записываем ту же задачу, но связываем её с системным ID бэкенда
+      await db.notes.put({
+        ...noteData,
+        id: resData.id,
+        isSynced: 1
+      });
+      
+      await syncAndLoad();
+    }
+  }
+
+  // Быстрая кнопка колокольчика (+1 час дедлайна)
+  async function addHourReminder(item) {
+    const oneHourLater = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    
+    // Обновляем локально
+    await db.notes.update(Number(item.id), {
+      deadline: oneHourLater,
+      notified: 0,
+      isSynced: 0
+    });
+    await refreshBoardFromIndexedDB();
+
+    // Отправляем на сервер
+    const updatedNote = await db.notes.get(Number(item.id));
+    const success = await updateNoteInBackend(updatedNote);
+    if (success) {
+      await db.notes.update(Number(item.id), { isSynced: 1 });
+    }
+  }
+
+  // Хэндлеры для Drag and Drop
+  function handleDndConsider(columnId, e) {
+    const colIdx = columns.findIndex(c => c.id === columnId);
+    columns[colIdx].items = e.detail.items;
+    columns = [...columns];
+  }
+
+  async function handleDndFinalize(columnId, e) {
+    const colIdx = columns.findIndex(c => c.id === columnId);
+    columns[colIdx].items = e.detail.items;
+    columns = [...columns];
+
+    const triggeredItem = e.detail.info?.id 
+      ? e.detail.items.find(i => i.id === e.detail.info.id)
+      : null;
+
+    if (triggeredItem) {
+      const numericId = Number(triggeredItem.id);
+      const originalNote = await db.notes.get(numericId);
+
+      // Сценарий 1: Перенос из todo в in_progress -> Запрос дедлайна
+      if (columnId === 'in_progress' && originalNote.status === 'todo') {
+        modalNote = triggeredItem;
+        modalDeadlineValue = "";
+        showDeadlineModal = true;
+        return;
       }
 
-    } catch (e) {
-      console.warn("Бэкенд недоступен, режим автосинхронизации приостановлен", e);
+      // Сценарий 2: Перенос в done -> дедлайн не ставится/сбрасывается
+      let updatedDeadline = originalNote.deadline;
+      if (columnId === 'done') {
+        updatedDeadline = null; 
+      }
+
+      await db.notes.update(numericId, { 
+        status: columnId, 
+        deadline: updatedDeadline,
+        isSynced: 0 
+      });
+      await refreshBoardFromIndexedDB();
+
+      const fullNote = await db.notes.get(numericId);
+      const success = await updateNoteInBackend(fullNote);
+      if (success) {
+        await db.notes.update(numericId, { isSynced: 1 });
+      }
     }
-    
-    // Перерисовываем колонки на экране
-    await loadFromLocal();
   }
 
-  // Чтение данных из IndexedDB (Dexie) и распределение по колонкам
-  async function loadFromLocal() {
-    const allNotes = await db.notes.orderBy('created_at').reverse().toArray();
-    
-    columns[0].items = allNotes.filter(n => n.status === 'todo');
-    columns[1].items = allNotes.filter(n => n.status === 'in_progress');
-    columns[2].items = allNotes.filter(n => n.status === 'done');
-    columns = [...columns]; // Принудительное обновление реактивности Svelte
-  }
+  // Сохранение дедлайна из модалки
+  async function saveModalDeadline() {
+    if (!modalNote) return;
+    const numericId = Number(modalNote.id);
+    const formattedDeadline = modalDeadlineValue ? new Date(modalDeadlineValue).toISOString() : null;
 
-  // 2. Создание новой заметки
-  async function addNote() {
-    if (!newNote) return;
-
-    const deadlineISO = deadline ? new Date(deadline).toISOString() : null;
-    const note = {
-      content: newNote,
-      deadline: deadlineISO,
-      created_at: new Date().toISOString(),
-      status: 'todo',
-      priority: newPriority, // Сохраняем выбранный приоритет в локальную БД
+    await db.notes.update(numericId, {
+      status: 'in_progress',
+      deadline: formattedDeadline,
+      notified: 0,
       isSynced: 0
-    };
+    });
 
-    const id = await db.notes.add(note);
-    await loadFromLocal();
+    closeModal();
+    await refreshBoardFromIndexedDB();
 
-    // Сброс формы в дефолтное состояние
-    newNote = "";
-    deadline = "";
-    newPriority = "medium";
-
-    const success = await sendNoteToBackend({ content: note.content, deadline: note.deadline, priority: note.priority });
+    const fullNote = await db.notes.get(numericId);
+    const success = await updateNoteInBackend(fullNote);
     if (success) {
-      await db.notes.update(id, { isSynced: 1 });
-      await loadFromLocal();
+      await db.notes.update(numericId, { isSynced: 1 });
     }
   }
 
-  // 3. Универсальное сохранение изменений (текст и/или дедлайн)
-  async function saveEdit(item) {
-    const updatedDeadline = editDeadline ? new Date(editDeadline).toISOString() : null;
-    
-    // Если дедлайн изменился, сбрасываем notified в 0, иначе оставляем старый статус
-    const isDeadlineChanged = item.deadline !== updatedDeadline;
-    const nextNotifiedStatus = isDeadlineChanged ? 0 : item.notified;
+  // Пропуск дедлайна в модалке
+  async function skipModalDeadline() {
+    if (!modalNote) return;
+    const numericId = Number(modalNote.id);
 
-    const updatedNote = {
-      ...item,
-      content: editContent,
-      deadline: updatedDeadline,
-      notified: nextNotifiedStatus,
+    await db.notes.update(numericId, {
+      status: 'in_progress',
+      deadline: null,
       isSynced: 0
-    };
+    });
 
-    // Обновляем локально в Dexie
-    await db.notes.update(item.id, { content: editContent, deadline: updatedDeadline, notified: nextNotifiedStatus, isSynced: 0 });
-    editingId = null;
-    await loadFromLocal();
+    closeModal();
+    await refreshBoardFromIndexedDB();
 
-    // Отправляем на бэкенд
-    const success = await updateNoteInBackend(updatedNote);
+    const fullNote = await db.notes.get(numericId);
+    const success = await updateNoteInBackend(fullNote);
     if (success) {
-      await db.notes.update(item.id, { isSynced: 1 });
-      await loadFromLocal();
+      await db.notes.update(numericId, { isSynced: 1 });
     }
   }
 
-  async function triggerReminderAgain(item) {
-    // Форсированно ставим notified в 0 локально
-    await db.notes.update(item.id, { notified: 0, isSynced: 0 });
-    await loadFromLocal();
-
-    const updatedNote = { ...item, notified: 0 };
-    
-    // Синхронизируем с сервером
-    const success = await updateNoteInBackend(updatedNote);
-    if (success) {
-      await db.notes.update(item.id, { isSynced: 1 });
-      await loadFromLocal();
-    }
+  function closeModal() {
+    showDeadlineModal = false;
+    modalNote = null;
+    modalDeadlineValue = "";
   }
 
-  // 4. Удаление заметки
-  async function deleteNote(id) {
-    await db.notes.delete(id);
-    await loadFromLocal();
+  // Удаление карточки
+  async function deleteCard(id) {
+    const numericId = Number(id);
+    await db.notes.delete(numericId);
+    await refreshBoardFromIndexedDB();
+
     try {
-      await fetch(`/api/notes?id=${id}`, { method: 'DELETE' });
+      await fetch(`/api/notes?id=${numericId}`, { method: 'DELETE' });
     } catch (e) {
-      console.error("Не удалось удалить заметку на сервере:", e);
+      console.error("Не удалось удалить на сервере, удалено локально", e);
     }
   }
 
-  // Перевод карточки в режим редактирования
+  // Редактирование текста напрямую
   function startEdit(item) {
     editingId = item.id;
     editContent = item.content;
-    
-    if (item.deadline) {
-      // Преобразуем UTC строку в локальный формат для корректного отображения в input datetime-local
-      const d = new Date(item.deadline);
-      const tzoffset = d.getTimezoneOffset() * 60000;
-      editDeadline = new Date(d.getTime() - tzoffset).toISOString().slice(0, 16);
-    } else {
-      editDeadline = "";
+    editDeadline = item.deadline ? item.deadline.slice(0, 16) : "";
+    editPriority = item.priority || "low";
+  }
+
+  async function saveEdit() {
+    const numericId = Number(editingId);
+    await db.notes.update(numericId, {
+      content: editContent,
+      deadline: editDeadline ? new Date(editDeadline).toISOString() : null,
+      priority: editPriority,
+      isSynced: 0
+    });
+    editingId = null;
+    await refreshBoardFromIndexedDB();
+
+    const fullNote = await db.notes.get(numericId);
+    const success = await updateNoteInBackend(fullNote);
+    if (success) {
+      await db.notes.update(numericId, { isSynced: 1 });
     }
   }
 
-  // --- ОБРАБОТЧИКИ DRAG AND DROP ---
-  function handleConsider(columnId, e) {
-    const colIdx = columns.findIndex(c => c.id === columnId);
-    columns[colIdx].items = e.detail.items;
-    columns = [...columns];
-  }
-
-  async function handleFinalize(columnId, e) {
-    const colIdx = columns.findIndex(c => c.id === columnId);
-    columns[colIdx].items = e.detail.items;
-    columns = [...columns];
-
-    for (const item of e.detail.items) {
-      if (item.status !== columnId) {
-        item.status = columnId;
-        await db.notes.update(item.id, { status: columnId, isSynced: 0 });
-        
-        const success = await updateNoteInBackend(item);
-        if (success) {
-          await db.notes.update(item.id, { isSynced: 1 });
-        }
-      }
-    }
-    await loadFromLocal();
-  }
-
-  onMount(() => {
-    // Первая загрузка при открытии страницы
-    syncAndLoad();
-
-    // Запускаем фоновый опрос сервера каждые 5 секунд
-    const interval = setInterval(syncAndLoad, 5000);
-
-    // Функция очистки (вызовется при уничтожении компонента Svelte)
-    return () => {
-      clearInterval(interval);
-    };
-  });
-
-  // Хелпер форматирования даты для вывода в карточке
-  function formatDate(dateStr) {
-    if (!dateStr) return '';
-    const date = new Date(dateStr);
-    return date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  function formatDisplayDate(isoString) {
+    if (!isoString) return '';
+    const d = new Date(isoString);
+    return d.toLocaleString('ru-RU', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
   }
 </script>
 
-<main>
-  <h1>Kanban Менеджер</h1>
+<main class="app-container">
+  <header class="app-header">
+    <div class="logo">🗂 Self<span>Manager</span></div>
+    <div class="status-indicator">Синхронизация: Active</div>
+  </header>
 
-  <div class="input-group">
-    <input bind:value={newNote} placeholder="Что нужно сделать?" />
-    <input bind:value={deadline} type="datetime-local" />
-    
-    <select bind:value={newPriority} class="priority-select">
-      <option value="low">🟢 Низкий</option>
-      <option value="medium">🟡 Средний</option>
-      <option value="high">🔴 Высокий</option>
-    </select>
+  <section class="creation-panel">
+    <div class="input-wrapper">
+      <input 
+        type="text" 
+        bind:value={newNote} 
+        placeholder="Какая задача перед нами стоит?.." 
+        on:keydown={(e) => e.key === 'Enter' && addNote()}
+      />
+      
+      <select bind:value={newPriority} class="priority-select {newPriority}">
+        <option value="low">🟢 Низкий</option>
+        <option value="medium">🟡 Средний</option>
+        <option value="high">🔴 Высокий</option>
+      </select>
 
-    <button on:click={addNote}>Добавить</button>
-  </div>
+      <button on:click={addNote} class="add-button">Создать</button>
+    </div>
+  </section>
 
-  <div class="board">
+  <div class="kanban-board">
     {#each columns as column (column.id)}
-      <div class="column">
-        <h2>{column.name}</h2>
-        <div class="drop-zone" 
-             use:dndzone={{items: column.items, flipDurationMs, dropTargetStyle: {}}} 
-             on:consider={(e) => handleConsider(column.id, e)} 
-             on:finalize={(e) => handleFinalize(column.id, e)}>
-          
+      <div class="kanban-column">
+        <div class="column-header">
+          <h3>{column.name}</h3>
+          <span class="badge">{column.items.length}</span>
+        </div>
+        
+        <div 
+          class="column-body"
+          use:dndzone={{ items: column.items, flipDurationMs }}
+          on:consider={(e) => handleDndConsider(column.id, e)}
+          on:finalize={(e) => handleDndFinalize(column.id, e)}
+        >
           {#each column.items as item (item.id)}
-            <div class="card priority-{item.priority || 'medium'}" animate:flip={{duration: flipDurationMs}}>
-              <div class="card-content">
-                {#if editingId === item.id}
-                  <input bind:value={editContent} class="edit-input" />
-                  <input type="datetime-local" bind:value={editDeadline} class="edit-input" />
-                  <div class="edit-actions">
-                    <button on:click={() => saveEdit(item)}>💾</button>
-                    <button on:click={() => editingId = null}>❌</button>
+            <div animate:flip={{ duration: flipDurationMs }} class="card priority-{item.priority}">
+              {#if editingId === item.id}
+                <div class="edit-mode">
+                  <textarea bind:value={editContent} rows="2"></textarea>
+                  <div class="edit-row">
+                    <input type="datetime-local" bind:value={editDeadline} />
+                    <select bind:value={editPriority}>
+                      <option value="low">Low</option>
+                      <option value="medium">Medium</option>
+                      <option value="high">High</option>
+                    </select>
                   </div>
-                {:else}
-                  <div on:click={() => startEdit(item)} class="text-clickable" role="button" tabindex="0" on:keydown={(e) => e.key === 'Enter' && startEdit(item)}>
-                    <span class="content-text">{item.content} {item.isSynced === 0 ? '⏳' : ''}</span>
+                  <div class="edit-actions">
+                    <button class="btn-save" on:click={saveEdit}>Готово</button>
+                    <button class="btn-cancel" on:click={() => editingId = null}>Отмена</button>
+                  </div>
+                </div>
+              {:else}
+                <div class="card-layout">
+                  <div class="card-main">
+                    <p class="card-text">{item.content}</p>
                     {#if item.deadline}
-                      <small class="deadline">Дедлайн: {formatDate(item.deadline)}</small>
+                      <span class="card-deadline">⏰ {formatDisplayDate(item.deadline)}</span>
                     {/if}
                   </div>
-                {/if}
-              </div>
-              
-              {#if editingId !== item.id}
-                <div class="card-controls">
-                  {#if item.deadline}
-                    <button class="action-btn" on:click={() => triggerReminderAgain(item)} title="Напомнить еще раз">🔔</button>
-                  {/if}
-                  <button class="delete-btn" on:click={() => deleteNote(item.id)}>✕</button>
+                  
+                  <div class="card-controls">
+                    <button class="action-btn bell-btn" on:click={() => addHourReminder(item)} title="Напомнить через 1 час">
+                      🔔
+                    </button>
+                    <button class="action-btn edit-btn" on:click={() => startEdit(item)} title="Редактировать">
+                      ✏️
+                    </button>
+                    <button class="action-btn delete-btn" on:click={() => deleteCard(item.id)} title="Удалить">
+                      🗑️
+                    </button>
+                  </div>
                 </div>
               {/if}
             </div>
           {/each}
-
         </div>
       </div>
     {/each}
   </div>
+
+  {#if showDeadlineModal}
+    <div class="modal-backdrop">
+      <div class="modal-window">
+        <h4>⏰ Сроки для задачи</h4>
+        <p>Вы переносите задачу в секцию <strong>В процессе</strong>. Желаете установить дедлайн?</p>
+        
+        <input type="datetime-local" bind:value={modalDeadlineValue} class="modal-input" />
+        
+        <div class="modal-buttons">
+          <button class="btn-accent" on:click={saveModalDeadline}>Установить срок</button>
+          <button class="btn-secondary" on:click={skipModalDeadline}>Пропустить</button>
+        </div>
+      </div>
+    </div>
+  {/if}
 </main>
 
 <style>
-  main { max-width: 1100px; margin: 2rem auto; font-family: system-ui, -apple-system, sans-serif; padding: 0 20px; }
-  .input-group { display: flex; gap: 10px; margin-bottom: 30px; }
-  input { padding: 10px; flex-grow: 1; border: 1px solid #ccc; border-radius: 6px; font-size: 0.95rem; }
-  button { padding: 10px 18px; cursor: pointer; background: #222; color: white; border: none; border-radius: 6px; font-weight: 500; }
-  button:hover { background: #444; }
-  
-  .board { display: flex; gap: 20px; align-items: flex-start; }
-  .column { 
-    flex: 1; 
-    background: #f1f2f4; 
-    border-radius: 10px; 
-    padding: 12px; 
-    min-height: 500px;
-    box-shadow: inset 0 0 4px rgba(0,0,0,0.05);
+  :global(body) {
+    margin: 0;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background-color: #0f172a; /* Глубокий slate-900 оттенок фона */
+    color: #f8fafc;
+
+    color-scheme: dark;
   }
-  h2 { font-size: 1rem; font-weight: 600; text-align: center; margin-bottom: 15px; color: #44546f; text-transform: uppercase; letter-spacing: 0.5px; }
-  
-  .drop-zone { min-height: 450px; height: 100%; }
-  
-  .card { 
-    background: white; 
-    padding: 14px; 
-    margin-bottom: 10px; 
-    border-radius: 8px; 
-    box-shadow: 0 1px 3px rgba(0,0,0,0.1), 0 1px 2px rgba(0,0,0,0.06);
+
+  .app-container {
+    max-width: 1300px;
+    margin: 0 auto;
+    padding: 20px;
+    box-sizing: border-box;
+  }
+
+  /* Хедер */
+  .app-header {
     display: flex;
     justify-content: space-between;
-    align-items: flex-start;
-    cursor: grab;
-    transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
-    /* Базовая левая граница для цветовой маркировки */
-    border-left: 5px solid #dfe1e6; 
+    align-items: center;
+    padding-bottom: 20px;
+    border-bottom: 1px solid #334155;
+    margin-bottom: 24px;
   }
-  .card:active { cursor: grabbing; }
-
-  /* Цветовые маркеры приоритетов */
-  .card.priority-high { border-left-color: #eb5757; }   /* Красный */
-  .card.priority-medium { border-left-color: #f2c94c; } /* Желтый */
-  .card.priority-low { border-left-color: #27ae60; }    /* Зеленый */
-
-  .card-content { display: flex; flex-direction: column; gap: 5px; width: 100%; }
-  
-  .text-clickable { cursor: pointer; display: flex; flex-direction: column; gap: 6px; width: 100%; }
-  .content-text { font-size: 0.95rem; color: #172b4d; word-break: break-word; }
-  
-  .edit-input { padding: 8px; margin-bottom: 8px; font-size: 0.9rem; width: 95%; border: 1px solid #0052cc; box-shadow: 0 0 0 1px #0052cc; }
-  .edit-actions { display: flex; gap: 8px; }
-  .edit-actions button { padding: 6px 12px; background: #f1f2f4; color: #172b4d; font-size: 0.9rem; }
-  .edit-actions button:hover { background: #e2e4e9; }
-
-  .deadline { color: #ae2e24; font-size: 0.8rem; font-weight: 500; background: #ffebe6; padding: 2px 6px; border-radius: 4px; width: fit-content; }
-  .delete-btn { background: transparent; color: #6b778c; padding: 2px 6px; margin-left: 8px; font-size: 1rem; border-radius: 4px; }
-  .delete-btn:hover { color: #ae2e24; background: #ffebe6; }
-
-  .card-controls { display: flex; align-items: center; gap: 4px; }
-  .action-btn { background: transparent; color: #6b778c; padding: 4px 6px; font-size: 0.95rem; border-radius: 4px; }
-  .action-btn:hover { background: #e2e4e9; color: #172b4d; }
-  .delete-btn { background: transparent; color: #6b778c; padding: 4px 8px; font-size: 1rem; border-radius: 4px; margin-left: 0; }
-
-  /* Стилизация селекта в форме */
-  .priority-select {
-    padding: 10px;
-    border: 1px solid #ccc;
-    border-radius: 6px;
-    background: white;
-    font-size: 0.95rem;
-    cursor: pointer;
-    font-family: inherit;
+  .logo {
+    font-size: 22px;
+    font-weight: 800;
+    letter-spacing: -0.5px;
   }
-  .priority-select:focus {
+  .logo span { color: #6366f1; }
+  .status-indicator {
+    font-size: 12px;
+    color: #10b981;
+    background: rgba(16, 185, 129, 0.1);
+    padding: 4px 10px;
+    border-radius: 20px;
+  }
+
+  /* Панель добавления */
+  .creation-panel {
+    background: #1e293b;
+    padding: 16px;
+    border-radius: 12px;
+    border: 1px solid #334155;
+    margin-bottom: 30px;
+    box-shadow: 0 4px 6px -1px rgba(0,0,0,0.2);
+  }
+  .input-wrapper {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+  }
+  .input-wrapper input {
+    flex: 1;
+    background: #0f172a;
+    border: 1px solid #475569;
+    padding: 12px 16px;
+    border-radius: 8px;
+    color: white;
+    font-size: 14px;
     outline: none;
-    border-color: #222;
+    transition: border 0.2s;
   }
+  .input-wrapper input:focus { border-color: #6366f1; }
+  
+  .priority-select {
+    padding: 11px;
+    background: #0f172a;
+    color: white;
+    border: 1px solid #475569;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+
+  .add-button {
+    background: #4f46e5;
+    color: white;
+    border: none;
+    padding: 12px 24px;
+    border-radius: 8px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+  .add-button:hover { background: #4338ca; }
+
+  /* Сетка Kanban */
+  .kanban-board {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 20px;
+    align-items: start;
+  }
+
+  .kanban-column {
+    background: #1e293b;
+    border-radius: 12px;
+    border: 1px solid #334155;
+    padding: 16px;
+    min-height: 500px;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .column-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+    padding-bottom: 8px;
+    border-bottom: 2px solid #334155;
+  }
+  .column-header h3 {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 700;
+    color: #cbd5e1;
+  }
+  .badge {
+    background: #334155;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 12px;
+    color: #94a3b8;
+  }
+
+  .column-body {
+    flex: 1;
+    min-height: 450px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  /* Карточки задач */
+  .card {
+    background: #273549;
+    border-left: 4px solid #94a3b8;
+    border-radius: 8px;
+    padding: 14px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    transition: transform 0.15s, box-shadow 0.15s;
+  }
+  .card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.25);
+  }
+
+  /* Градации приоритетов */
+  .card.priority-high { border-left-color: #ef4444; }
+  .card.priority-medium { border-left-color: #eab308; }
+  .card.priority-low { border-left-color: #10b981; }
+
+  .card-layout {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .card-main {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    flex: 1;
+  }
+  .card-text {
+    margin: 0;
+    font-size: 14px;
+    line-height: 1.5;
+    color: #f1f5f9;
+    word-break: break-word;
+  }
+  .card-deadline {
+    font-size: 11px;
+    color: #94a3b8;
+    background: rgba(255,255,255,0.05);
+    padding: 2px 6px;
+    border-radius: 4px;
+    width: fit-content;
+  }
+
+  .card-controls {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    justify-content: flex-start;
+  }
+  .action-btn {
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    padding: 4px;
+    border-radius: 4px;
+    font-size: 14px;
+    transition: background 0.2s;
+  }
+  .action-btn:hover { background: rgba(255,255,255,0.1); }
+
+  /* Режим редактирования внутри карточки */
+  .edit-mode {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    width: 100%;
+  }
+  .edit-mode textarea {
+    background: #0f172a;
+    color: white;
+    border: 1px solid #475569;
+    border-radius: 6px;
+    padding: 6px;
+    font-size: 13px;
+    resize: none;
+  }
+  .edit-row {
+    display: flex;
+    gap: 6px;
+  }
+  .edit-row input, .edit-row select {
+    background: #0f172a;
+    color: white;
+    border: 1px solid #475569;
+    border-radius: 4px;
+    padding: 4px;
+    font-size: 12px;
+    flex: 1;
+    color-scheme: dark;
+  }
+  .edit-actions {
+    display: flex;
+    gap: 6px;
+  }
+  .edit-actions button {
+    flex: 1;
+    padding: 6px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .btn-save { background: #10b981; color: white; }
+  .btn-cancel { background: #475569; color: white; }
+
+  /* Модальное окно */
+  .modal-backdrop {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(15, 23, 42, 0.8);
+    backdrop-filter: blur(4px);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 999;
+  }
+  .modal-window {
+    background: #1e293b;
+    border: 1px solid #475569;
+    border-radius: 12px;
+    padding: 24px;
+    max-width: 400px;
+    width: 100%;
+    box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5);
+  }
+  .modal-window h4 { margin: 0 0 10px 0; font-size: 18px; color: white;}
+  .modal-window p { font-size: 14px; color: #94a3b8; margin-bottom: 16px; line-height: 1.4;}
+  .modal-input {
+    width: 100%;
+    background: #0f172a;
+    border: 1px solid #475569;
+    color: white;
+    padding: 10px;
+    border-radius: 6px;
+    margin-bottom: 20px;
+    box-sizing: border-box;
+    color-scheme: dark;
+  }
+  .modal-buttons {
+    display: flex;
+    gap: 12px;
+  }
+  .modal-buttons button {
+    flex: 1;
+    padding: 10px;
+    border: none;
+    border-radius: 6px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .btn-accent { background: #4f46e5; color: white; }
+  .btn-secondary { background: #334155; color: #cbd5e1; }
 </style>

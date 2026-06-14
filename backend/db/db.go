@@ -25,7 +25,7 @@ func InitDB(filepath string) error {
 		deadline DATETIME,
     	notified BOOLEAN DEFAULT 0,
         status TEXT DEFAULT 'todo',
-        priority TEXT DEFAULT 'medium'
+        priority TEXT DEFAULT 'low'
 	);`
 	
 	_, err = DB.Exec(query)
@@ -33,16 +33,26 @@ func InitDB(filepath string) error {
 	return err
 }
 
-func AddNote(content string, deadline string, priority string) error {
-	if priority == "" {
-		priority = "medium"
-	}
-	if deadline == "" {
-		_, err := DB.Exec("INSERT INTO notes (content, priority) VALUES (?, ?)", content, priority)
-		return err
-	}
-	_, err := DB.Exec("INSERT INTO notes (content, deadline, priority) VALUES (?, ?, ?)", content, deadline, priority)
-	return err
+func AddNote(content string, deadline string, priority string) (int64, error) {
+    if priority == "" {
+        priority = "low"
+    }
+    
+    var res sql.Result
+    var err error
+
+    if deadline == "" {
+        res, err = DB.Exec("INSERT INTO notes (content, priority) VALUES (?, ?)", content, priority)
+    } else {
+        res, err = DB.Exec("INSERT INTO notes (content, deadline, priority) VALUES (?, ?, ?)", content, deadline, priority)
+    }
+
+    if err != nil {
+        return 0, err
+    }
+
+    id, err := res.LastInsertId()
+    return id, err
 }
 
 func DeleteNote(id int) error {
@@ -75,7 +85,7 @@ func GetAllNotes() ([]models.Note, error) {
 
 func UpdateNote(id int, content string, deadline string, status string, notified bool, priority string) error {
 	if priority == "" {
-		priority = "medium"
+		priority = "low"
 	}
 	if deadline == "" {
 		_, err := DB.Exec("UPDATE notes SET content = ?, deadline = NULL, status = ?, notified = ?, priority = ? WHERE id = ?", content, status, notified, priority, id)

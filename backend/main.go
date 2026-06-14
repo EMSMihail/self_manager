@@ -31,29 +31,33 @@ func notesHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(notes)
 
 	case http.MethodPost:
-		var n struct { 
-			Content  string `json:"content"` 
-			Deadline string `json:"deadline"` 
-			Priority string `json:"priority"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&n); err != nil {
-			slog.Warn("Ошибка декодирования POST body", "err", err)
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		
-		if err := db.AddNote(n.Content, n.Deadline, n.Priority); err != nil {
-			slog.Error("Ошибка добавления заметки в БД", "err", err, "content", n.Content)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
+        var n struct { 
+            Content  string `json:"content"` 
+            Deadline string `json:"deadline"` 
+            Priority string `json:"priority"`
+        }
+        if err := json.NewDecoder(r.Body).Decode(&n); err != nil {
+            slog.Warn("Ошибка декодирования POST body", "err", err)
+            http.Error(w, err.Error(), http.StatusBadRequest)
+            return
+        }
+        
+        insertedID, err := db.AddNote(n.Content, n.Deadline, n.Priority)
+        if err != nil {
+            slog.Error("Ошибка добавления заметки в БД", "err", err, "content", n.Content)
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
 
-		token := os.Getenv("TELEGRAM_TOKEN")
-		chatID := os.Getenv("TELEGRAM_CHAT_ID")
-		if token != "" && chatID != "" {
-			bot.SendMessage(token, chatID, "🆕 Новая заметка: "+n.Content)
-		}
-		w.WriteHeader(http.StatusCreated)
+        token := os.Getenv("TELEGRAM_TOKEN")
+        chatID := os.Getenv("TELEGRAM_CHAT_ID")
+        if token != "" && chatID != "" {
+            bot.SendMessage(token, chatID, "🆕 Новая заметка: "+n.Content)
+        }
+
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(http.StatusCreated)
+        json.NewEncoder(w).Encode(map[string]int64{"id": insertedID})
 	
 	case http.MethodDelete:
 		// Извлекаем ID из URL (например, /api/notes?id=1)
@@ -107,7 +111,7 @@ func startNotificationWorker(ctx context.Context) {
 			case <-ticker.C:
 				slog.Info("Воркер проверяет БД...")
 			
-				rows, err := db.DB.Query("SELECT id, content, deadline, priority FROM notes WHERE notified = 0 AND deadline IS NOT NULL AND status = 'todo'")
+				rows, err := db.DB.Query("SELECT id, content, deadline, priority FROM notes WHERE notified = 0 AND deadline IS NOT NULL AND status != 'done'")
 				if err != nil {
 					slog.Error("Ошибка выполнения запроса в воркере", "err", err)
 					continue
