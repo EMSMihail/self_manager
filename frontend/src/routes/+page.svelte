@@ -7,6 +7,7 @@
   import { fetchNotesFromBackend, sendNoteToBackend, updateNoteInBackend } from '$lib/api';
 
   const flipDurationMs = 200;
+
   let newNote = "";
   let newDescription = "";
   let deadline = "";
@@ -53,6 +54,14 @@
   ];
   let searchedWallpapers = [...defaultWallpapers];
 
+  function utcToLocalInputString(isoString) {
+    if (!isoString) return "";
+    const d = new Date(isoString);
+    if (isNaN(d.getTime())) return "";
+    const offset = d.getTimezoneOffset() * 60000; 
+    return new Date(d.getTime() - offset).toISOString().slice(0, 16);
+  }
+
   // Динамическая функция поиска через ключевые слова (Unsplash NAPI)
   async function searchBackgrounds() {
     if (!searchQuery.trim()) return;
@@ -61,9 +70,14 @@
     
     try {
       const response = await fetch(`/api/backgrounds?query=${encodeURIComponent(searchQuery)}`);
+      
+      // Перехватываем ограничение демо-лимита Unsplash
+      if (response.status === 403) {
+        throw new Error("⏳ Лимит демо-версии API (50 запросов в час) исчерпан. Пожалуйста, выберите стандартные обои или попробуйте позже.");
+      }
+      
       const data = await response.json();
       
-      // Если сервер вернул ошибку (404, 403, 500)
       if (!response.ok) {
         throw new Error(data.error || `Код ответа сервера: ${response.status}`);
       }
@@ -82,8 +96,7 @@
         searchError = "Ничего не найдено. Попробуйте другое слово.";
       }
     } catch (err) {
-      console.error("Фронтенд поймал ошибку:", err);
-      // Выводим реальный текст ошибки прямо на UI шторки настройки
+      console.error("Фронтенд поймал ошибку фонов:", err);
       searchError = err.message;
     } finally {
       isSearchingImages = false;
@@ -197,9 +210,18 @@
     usePhotoBackground = localStorage.getItem('sm-use-photo-bg') === 'true';
     bgImageUrl = localStorage.getItem('sm-bg-image-url') || defaultWallpapers[0].url;
     
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission();
+    }
+
     await syncAndLoad();
-    setInterval(syncAndLoad, 15000);
-  });
+    await checkDeadlinesAndNotify();
+
+    setInterval(async () => {
+      await syncAndLoad();
+      await checkDeadlinesAndNotify();
+    }, 15000);
+  })
 
   async function addNote() {
     if (!newNote.trim()) return;
@@ -235,7 +257,11 @@
   }
 
   async function addHourReminder(item) {
-    const oneHourLater = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    if ("Notification" in window && Notification.permission === "default") {
+      await Notification.requestPermission();
+    }
+
+    const oneHourLater = new Date(Date.now() + 5 * 1000).toISOString();
     await db.notes.update(Number(item.id), { deadline: oneHourLater, notified: 0, isSynced: 0 });
     await refreshBoardFromIndexedDB();
 
@@ -326,7 +352,7 @@
     editingId = item.id;
     editContent = item.content;
     editDescription = item.description || "";
-    editDeadline = item.deadline ? item.deadline.slice(0, 16) : "";
+    editDeadline = utcToLocalInputString(item.deadline);
     editPriority = item.priority || "low";
   }
 
@@ -351,6 +377,44 @@
     if (!isoString) return '';
     const d = new Date(isoString);
     return d.toLocaleString('ru-RU', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  }
+
+  async function checkDeadlinesAndNotify() {
+    if (typeof window === 'undefined' || !("Notification" in window) || Notification.permission !== "granted") return;
+
+    const now = new Date();
+    const allNotes = await db.notes.toArray();
+    let hasChanges = false;
+
+    for (const note of allNotes) {
+      // Ищем невыполненные задачи с наступившим дедлайном, которые еще не отправляли пуш
+      if (note.deadline && !note.notified && note.status !== 'done') {
+        const deadlineDate = new Date(note.deadline);
+        
+        if (deadlineDate <= now) {
+          // Вызываем нативное системное уведомление операционной системы
+          new Notification("⏰ Внимание! Срок задачи истек", {
+            body: `Задача: "${note.content}" требует вашего внимания!`,
+            tag: String(note.id) // предотвращает дублирование пушей для одной и той же карточки
+          });
+
+          // Локально помечаем, что уведомление отправлено
+          await db.notes.update(note.id, { notified: 1, isSynced: 0 });
+          hasChanges = true;
+
+          // Отправляем апдейт на бэкенд
+          const fullNote = await db.notes.get(note.id);
+          const success = await updateNoteInBackend(fullNote);
+          if (success) {
+            await db.notes.update(note.id, { isSynced: 1 });
+          }
+        }
+      }
+    }
+
+    if (hasChanges) {
+      await refreshBoardFromIndexedDB();
+    }
   }
 </script>
 
@@ -622,7 +686,39 @@
     color: #f8fafc;
     overflow-x: hidden;
     -webkit-font-smoothing: antialiased;
+    color-scheme: dark;
   }
+
+  .edit-mode {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    width: 100%;
+  }
+  .edit-title-input, .edit-mode textarea, .edit-mode input[type="datetime-local"], .edit-mode select {
+    background: #0f172a !important;
+    border: 1px solid #475569 !important;
+    color: #f1f5f9 !important;
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-size: 13px;
+    outline: none;
+    color-scheme: dark;
+  }
+  .edit-row {
+    display: flex;
+    gap: 6px;
+  }
+  .edit-row input { flex: 2; }
+  .edit-row select { flex: 1; }
+  .edit-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 6px;
+    margin-top: 4px;
+  }
+  .btn-save { background: #10b981; color: white; border: none; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 600; }
+  .btn-cancel { background: #475569; color: white; border: none; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
 
   /* Макет с поддержкой сдвига контента (Вариант А) */
   .app-layout {
