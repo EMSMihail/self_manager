@@ -12,6 +12,7 @@
   let newDescription = "";
   let deadline = "";
   let newPriority = "low";
+  let isOnline = navigator.onLine;
 
   // Управление панелями интерфейса
   let showCreationPanel = false;
@@ -194,34 +195,76 @@
     });
   }
 
-  function isCardVisible(item, currentPriorityFilter, currentUrgentFilter) {
-    if (currentPriorityFilter !== "all" && item.priority !== currentPriorityFilter) return false;
-    if (currentUrgentFilter) {
-      if (!item.deadline) return false;
-      const todayStr = new Date().toISOString().split('T')[0];
-      return item.deadline.split('T')[0] <= todayStr;
+  function isCardVisible(item, priorityFilter, urgentFilter, columnId) {
+    // 1. Фильтр по приоритету
+    if (priorityFilter !== 'all' && item.priority !== priorityFilter) {
+      return false;
     }
+    
+    // 2. Фильтр "Только горящие"
+    if (urgentFilter) {
+      // Скрываем, если нет дедлайна
+      if (!item.deadline) return false;
+      
+      // Скрываем, если карточка НЕ в "Планы" (todo) и НЕ в "В процессе" (in_progress)
+      if (columnId !== 'todo' && columnId !== 'in_progress') {
+        return false;
+      }
+    }
+    
     return true;
   }
 
-  onMount(async () => {
-    currentTheme = localStorage.getItem('sm-theme') || 'default';
-    currentCardStyle = localStorage.getItem('sm-card-style') || 'style-default';
-    usePhotoBackground = localStorage.getItem('sm-use-photo-bg') === 'true';
-    bgImageUrl = localStorage.getItem('sm-bg-image-url') || defaultWallpapers[0].url;
-    
-    if ("Notification" in window && Notification.permission === "default") {
-      Notification.requestPermission();
+  // Универсальная функция проверки связи
+  async function checkConnection() {
+    // 1. Проверяем наличие интернета на уровне браузера
+    if (!navigator.onLine) {
+      isOnline = false;
+      return;
     }
 
-    await syncAndLoad();
-    await checkDeadlinesAndNotify();
+    // 2. Проверяем связь с сервером (Heartbeat)
+    try {
+      // Замените '/api/health' на ваш реальный эндпоинт, 
+      // который возвращает 200 OK (можно просто корневой путь)
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 3000); // Таймаут 3 сек
+      
+      const response = await fetch('/api/health', { signal: controller.signal });
+      isOnline = response.ok; 
+    } catch (err) {
+      isOnline = false; // Сервер недоступен или тайм-аут
+    }
+  }
 
-    setInterval(async () => {
-      await syncAndLoad();
-      await checkDeadlinesAndNotify();
-    }, 15000);
-  })
+  onMount(async () => {
+    // 1. ПЕРВЫМ ДЕЛОМ загружаем данные из локальной БД
+    // Это гарантирует, что доска будет не пустой сразу при открытии
+    await refreshBoardFromIndexedDB();
+
+    // 2. Инициализируем проверку сети (но не ждем её завершения для отрисовки)
+    checkConnection(); 
+
+    // 3. Настраиваем слушатели событий сети
+    window.addEventListener('online', checkConnection);
+    window.addEventListener('offline', checkConnection);
+
+    // 4. Запускаем фоновую синхронизацию
+    const interval = setInterval(async () => {
+      await checkConnection(); // Проверяем статус
+      if (isOnline) {
+        // Если онлайн — пытаемся синхронизировать и обновить доску
+        await syncNotes();
+        await refreshBoardFromIndexedDB();
+      }
+    }, 10000);
+
+    return () => {
+      window.removeEventListener('online', checkConnection);
+      window.removeEventListener('offline', checkConnection);
+      clearInterval(interval);
+    };
+  });
 
   async function addNote() {
     if (!newNote.trim()) return;
@@ -429,7 +472,12 @@
       <div class="logo">🗂 Self<span>Manager</span></div>
       
       <div class="header-actions">
-        <div class="status-indicator">Active</div>
+        <div class="status-bar">
+          <div class="status-indicator">
+            <span class="dot" class:active={isOnline}></span>
+            <span>{isOnline ? 'Active' : 'Offline'}</span>
+          </div>
+        </div>
         
         <button 
           class="action-toggle-btn create-btn" 
@@ -495,7 +543,7 @@
             {#each column.items as item (item.id)}
               <div 
                 animate:flip={{ duration: flipDurationMs }} 
-                class="card priority-{item.priority} {currentCardStyle} {isCardVisible(item, filterPriority, filterUrgent) ? '' : 'hidden-card'}"
+                class="card priority-{item.priority} {currentCardStyle} {isCardVisible(item, filterPriority, filterUrgent, column.id) ? '' : 'hidden-card'}"
               >
                 {#if editingId === item.id}
                   <div class="edit-mode">
@@ -761,6 +809,10 @@
     pointer-events: none;
   }
 
+  :global(.hidden-card) {
+    display: none !important;
+  }
+
   /* Матовое стекло на элементах при активных фотообоях */
   :global(body.has-photo-bg) .kanban-column,
   :global(body.has-photo-bg) .creation-panel,
@@ -910,7 +962,38 @@
   .logo { font-size: 22px; font-weight: 800; }
   .logo span { color: #6366f1; }
   .header-actions { display: flex; align-items: center; gap: 12px; }
-  .status-indicator { font-size: 11px; color: #10b981; background: rgba(16, 185, 129, 0.1); padding: 6px 12px; border-radius: 20px; font-weight: 600; }
+  .status-bar { 
+    display: flex; 
+    align-items: center; 
+    gap: 12px; 
+    font-family: sans-serif; 
+    font-size: 13px; 
+  }
+
+  .status-indicator { 
+    display: flex; 
+    align-items: center; 
+    gap: 6px; 
+    min-width: 70px; /* Чтобы текст не двигал соседние элементы */
+    font-weight: 600;
+  }
+
+  .dot { 
+    width: 8px; 
+    height: 8px; 
+    border-radius: 50%; 
+    background-color: #64748b; /* Серый по умолчанию */
+  }
+
+  .dot.active { 
+    background-color: #10b981; /* Зеленый (Active) */
+    box-shadow: 0 0 6px #10b981;
+  }
+
+  /* Если статус Offline, можно добавить красный цвет тексту */
+  .status-indicator:not(:has(.active)) { color: #ef4444; }
+  .status-indicator:has(.active) { color: #10b981; }
+  
 
   .action-toggle-btn { width: 42px; height: 42px; display: flex; align-items: center; justify-content: center; background: #1e293b; border: 1px solid #334155; border-radius: 50%; color: white; cursor: pointer; transition: all 0.2s; }
   .action-toggle-btn:hover, .action-toggle-btn.active { background: #4f46e5; border-color: #6366f1; transform: scale(1.05); }
@@ -965,9 +1048,9 @@
 
   /* Карточки */
   .card { background: #273549; border-left: 4px solid #94a3b8; border-radius: 6px; padding: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.15); }
-  .card.priority-high { border-left-color: #ef4444; }
-  .card.priority-medium { border-left-color: #eab308; }
-  .card.priority-low { border-left-color: #10b981; }
+  .card.priority-high { border-left: 4px solid #ef4444 !important; }
+  .card.priority-medium { border-left: 4px solid #eab308 !important; }
+  .card.priority-low { border-left: 4px solid #10b981 !important; }
   .card-layout { display: flex; justify-content: space-between; gap: 10px; }
   .card-main { display: flex; flex-direction: column; gap: 4px; flex: 1; }
   .card-text { margin: 0; font-size: 13px; font-weight: 600; color: #f1f5f9; word-break: break-word; }

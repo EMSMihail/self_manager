@@ -3,249 +3,42 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"self-manager/bot"
-	"self-manager/db"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
+
+	"self-manager/bot"
+	"self-manager/db"
+	"self-manager/handlers"
+	"self-manager/worker"
 )
 
-// Функция-обработчик для заметок
-func notesHandler(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		notes, err := db.GetAllNotes()
-		if err != nil {
-			slog.Error("Не удалось получить заметки", "err", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(notes)
-
-	case http.MethodPost:
-        var n struct { 
-            Content  string `json:"content"`
-			Description string `json:"description"`
-            Deadline string `json:"deadline"` 
-            Priority string `json:"priority"`
-        }
-        if err := json.NewDecoder(r.Body).Decode(&n); err != nil {
-            slog.Warn("Ошибка декодирования POST body", "err", err)
-            http.Error(w, err.Error(), http.StatusBadRequest)
-            return
-        }
-        
-		insertedID, err := db.AddNote(n.Content, n.Description, n.Deadline, n.Priority)
-        if err != nil {
-            slog.Error("Ошибка добавления заметки в БД", "err", err, "content", n.Content)
-            http.Error(w, err.Error(), http.StatusInternalServerError)
-            return
-        }
-
-        token := os.Getenv("TELEGRAM_TOKEN")
-        chatID := os.Getenv("TELEGRAM_CHAT_ID")
-        if token != "" && chatID != "" {
-            bot.SendMessage(token, chatID, "🆕 Новая заметка: "+n.Content)
-        }
-
-        w.Header().Set("Content-Type", "application/json")
-        w.WriteHeader(http.StatusCreated)
-        json.NewEncoder(w).Encode(map[string]int64{"id": insertedID})
-	
-	case http.MethodDelete:
-		// Извлекаем ID из URL (например, /api/notes?id=1)
-		idStr := r.URL.Query().Get("id")
-		id, _ := strconv.Atoi(idStr)
-		if err := db.DeleteNote(id); err != nil {
-			slog.Error("Ошибка удаления заметки", "err", err, "id", id)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-
-	case http.MethodPut:
-		var updateData struct {
-			ID          int    `json:"id"`
-			Content     string `json:"content"`
-			Description string `json:"description"`
-			Deadline    string `json:"deadline"`
-			Status      string `json:"status"`
-			Notified    bool   `json:"notified"`
-			Priority    string `json:"priority"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&updateData); err != nil {
-			slog.Warn("Ошибка декодирования PUT body", "err", err)
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		
-		if err := db.UpdateNote(updateData.ID, updateData.Content, updateData.Description, updateData.Deadline, updateData.Status, updateData.Notified, updateData.Priority); err != nil {
-			slog.Error("Ошибка обновления заметки", "err", err, "id", updateData.ID)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-
-	default:
-		w.WriteHeader(http.StatusMethodNotAllowed)
-	}
-}
-
-func startNotificationWorker(ctx context.Context) {
-	loc, _ := time.LoadLocation("Europe/Moscow")
-	ticker := time.NewTicker(10 * time.Second)
-
-	go func() {
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				slog.Info("Фоновый воркер уведомлений успешно остановлен")
-				return
-			case <-ticker.C:
-				slog.Info("Воркер проверяет БД...")
-			
-				rows, err := db.DB.Query("SELECT id, content, deadline, priority FROM notes WHERE notified = 0 AND deadline IS NOT NULL AND status != 'done'")
-				if err != nil {
-					slog.Error("Ошибка выполнения запроса в воркере", "err", err)
-					continue
-				}
-			
-			now := time.Now().In(loc)
-			var idsToNotify []int
-
-			for rows.Next() {
-				var id int
-				var content, deadlineStr, priority string
-					if err := rows.Scan(&id, &content, &deadlineStr, &priority); err != nil {
-						slog.Error("Ошибка сканирования строки в воркере", "err", err)
-						continue
-					}
-
-				deadlineTime, err := time.Parse(time.RFC3339, deadlineStr)
-				if err == nil {
-					deadlineTime = deadlineTime.In(loc)
-				}
-
-				if err == nil && now.After(deadlineTime) {
-					token := os.Getenv("TELEGRAM_TOKEN")
-					chatID := os.Getenv("TELEGRAM_CHAT_ID")
-					
-					// Подбираем эмодзи под уровень важности
-					emoji := "🟡"
-					switch priority {
-						case "high":
-							emoji = "🔴"
-						case "low":
-							emoji = "🟢"
-					}
-					
-					msgText := fmt.Sprintf("%s *Напоминание (%s приоритет):*\n\n%s", emoji, strings.ToUpper(priority), content)
-					if err := bot.SendMessageWithButtons(token, chatID, msgText, id); err == nil {
-						idsToNotify = append(idsToNotify, id) 
-						} else {
-							slog.Error("Ошибка отправки сообщения через ТГ бот", "err", err, "note_id", id)
-					}
-				}
-			}
-			rows.Close() 
-
-			for _, id := range idsToNotify {
-				_, err := db.DB.Exec("UPDATE notes SET notified = 1 WHERE id = ?", id)
-				if err != nil {
-						slog.Error("Ошибка при пометке notified=1 в БД", "err", err, "id", id)
-					}
-				}
-			}
-		}
-	}()
-}
-
-func backgroundsHandler(w http.ResponseWriter, r *http.Request) {
-    if r.Method != http.MethodGet {
-        w.WriteHeader(http.StatusMethodNotAllowed)
-        return
-    }
-
-    query := r.URL.Query().Get("query")
-    if query == "" {
-        w.Header().Set("Content-Type", "application/json")
-        w.Write([]byte(`{"results":[]}`))
-        return
-    }
-
-    accessKey := os.Getenv("UNSPLASH_ACCESS_KEY")
-    if accessKey == "" {
-        slog.Error("Переменная окружения UNSPLASH_ACCESS_KEY не задана")
-        http.Error(w, "Внутренняя ошибка конфигурации", http.StatusInternalServerError)
-        return
-    }
-
-    escapedQuery := url.QueryEscape(query)
-    // ВАЖНО: адрес меняется на api.unsplash.com
-    unsplashURL := fmt.Sprintf("https://api.unsplash.com/search/photos?query=%s&per_page=12", escapedQuery)
-
-    req, err := http.NewRequest(http.MethodGet, unsplashURL, nil)
-    if err != nil {
-        slog.Error("Ошибка создания запроса к Unsplash", "err", err)
-        http.Error(w, "Внутренняя ошибка сервера", http.StatusInternalServerError)
-        return
-    }
-
-    // Передаем токен авторизации вместо фейкового User-Agent
-    req.Header.Set("Authorization", "Client-ID "+accessKey)
-
-    client := &http.Client{Timeout: 10 * time.Second}
-    resp, err := client.Do(req)
-    if err != nil {
-        slog.Error("Ошибка сети при запросе к Unsplash", "err", err)
-        http.Error(w, "Ошибка внешнего API", http.StatusBadGateway)
-        return
-    }
-    defer resp.Body.Close()
-
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(resp.StatusCode)
-
-    _, err = io.Copy(w, resp.Body)
-    if err != nil {
-        slog.Error("Ошибка копирования тела ответа Unsplash", "err", err)
-    }
-}
-
 func main() {
+	// Настройка структурированного логирования
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
 	staticPath := "./frontend/build"
 
-	// Инициализация БД
+	// Инициализация базы данных
 	if err := db.InitDB("./data/manager.db"); err != nil {
 		slog.Error("Критическая ошибка инициализации БД", "err", err)
 		os.Exit(1)
 	}
 
-	// API Маршруты
+	// Инициализация API Эндпоинтов из слоя Handlers
 	http.HandleFunc("/api/ping", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
+	http.HandleFunc("/api/notes", handlers.NotesHandler)
+	http.HandleFunc("/api/backgrounds", handlers.BackgroundsHandler)
 
-	http.HandleFunc("/api/notes", notesHandler)
-
-	http.HandleFunc("/api/backgrounds", backgroundsHandler)
-
-	// Статика и SPA
+	// Раздача фронтенд-статики и роутинг для SPA
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		path := filepath.Join(staticPath, r.URL.Path)
 		if info, err := os.Stat(path); err == nil && !info.IsDir() {
@@ -255,56 +48,21 @@ func main() {
 		http.ServeFile(w, r, filepath.Join(staticPath, "index.html"))
 	})
 
-	// Контекст для контроля жизненного цикла горутин
+	// Контекст для централизованного контроля жизненного цикла горутин
 	rootCtx, cancelRootCtx := context.WithCancel(context.Background())
 	defer cancelRootCtx()
 
 	token := os.Getenv("TELEGRAM_TOKEN")
-	
-	// ЗАПУСКАЕМ СЛУШАТЕЛЬ КЛИКОВ ПО КНОПКАМ
+
+	// Старт слушателя инлайн-кнопок Telegram (Long-polling)
 	if token != "" {
-		bot.StartCallbackListener(token, func(action string, noteID int, callbackID string, chatID int64, msgID int, originalText string) {
-			note, err := db.GetNoteByID(noteID)
-			if err != nil {
-				bot.AnswerCallback(token, callbackID, "Задача уже удалена")
-				return
-			}
-
-			var textStatus string
-			
-			if action == "done" {
-				// Сохраняем оригинальный дедлайн в строку, если он есть
-				var deadlineStr string
-				if note.Deadline != nil {
-					deadlineStr = note.Deadline.Format(time.RFC3339)
-				}
-
-				db.UpdateNote(note.ID, note.Content, note.Description, deadlineStr, "done", true, note.Priority)
-				textStatus = "✅ Выполнено"
-				
-			} else if action == "postpone" {
-				// Сдвигаем дедлайн на 1 час вперед относительно текущего момента
-				loc, _ := time.LoadLocation("Europe/Moscow")
-				newDeadline := time.Now().In(loc).Add(1 * time.Hour).Format(time.RFC3339)
-				
-
-				db.UpdateNote(note.ID, note.Content, note.Description, newDeadline, note.Status, false, note.Priority)
-				textStatus = "⏰ Отложено на 1 час"
-			}
-
-			// 1. Гасим состояние загрузки на кнопке
-			bot.AnswerCallback(token, callbackID, textStatus)
-			
-			// 2. Схлопываем кнопки в ТГ, обновляя сообщение финальным статусом
-			finalText := fmt.Sprintf("%s\n\nИтог: %s", originalText, textStatus)
-			bot.EditMessageText(token, chatID, msgID, finalText)
-		})
+		bot.StartCallbackListener(token, handlers.HandleTelegramCallback)
 	}
 
-	// Запуск воркера с контекстом отмены
-	startNotificationWorker(rootCtx)
+	// Старт тикера дедлайнов
+	worker.StartNotificationWorker(rootCtx)
 
-	// Настройка HTTP-сервера для Graceful Shutdown
+	// Конфигурация и запуск HTTP-сервера
 	srv := &http.Server{
 		Addr:    ":8080",
 		Handler: nil,
@@ -318,17 +76,17 @@ func main() {
 		}
 	}()
 
-	// Ожидаем системных сигналов завершения
+	// Обработка сигналов Graceful Shutdown
 	stopSignal := make(chan os.Signal, 1)
 	signal.Notify(stopSignal, os.Interrupt, syscall.SIGTERM)
 	<-stopSignal
 
 	slog.Info("Получен сигнал завершения. Начинаем Graceful Shutdown...")
-	
-	// 1. Останавливаем фоновые воркеры
+
+	// 1. Посылаем сигнал отмены фоновым процессам (тикеру нотификаций)
 	cancelRootCtx()
 
-	// 2. Даем серверу 5 секунд на завершение текущих сетевых запросов
+	// 2. Даем HTTP-серверу 5 секунд на завершение обработки текущих запросов
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelShutdown()
 

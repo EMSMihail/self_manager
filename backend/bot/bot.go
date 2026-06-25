@@ -13,7 +13,7 @@ import (
 // SendMessage оствляем старым для совместимости (например, при создании новой заметки)
 func SendMessage(token, chatID, text string) error {
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
-	
+
 	params := url.Values{}
 	params.Add("chat_id", chatID)
 	params.Add("text", text)
@@ -111,13 +111,13 @@ func StartCallbackListener(token string, handleCallback func(action string, note
 				// Если пришёл клик по inline-кнопке
 				if update.CallbackQuery != nil && update.CallbackQuery.Message != nil {
 					cb := update.CallbackQuery
-					
+
 					// Разбираем data (например: "done:15")
 					parts := strings.Split(cb.Data, ":")
 					if len(parts) == 2 {
 						action := parts[0]
 						noteID, _ := strconv.Atoi(parts[1])
-						
+
 						// Передаем управление в callback-функцию, которую мы опишем в main.go
 						handleCallback(action, noteID, cb.ID, cb.Message.Chat.ID, cb.Message.MessageID, cb.Message.Text)
 					}

@@ -28,11 +28,11 @@ func InitDB(filepath string) error {
         status TEXT DEFAULT 'todo',
         priority TEXT DEFAULT 'low'
 	);`
-	
+
 	_, err = DB.Exec(query)
 	if err != nil {
-	return err
-}
+		return err
+	}
 
 	// Миграция для существующей базы: добавляем колонку, если её не было.
 	// Ошибку игнорируем, так как если колонка уже есть, SQLite выдаст ошибку "duplicate column name"
@@ -42,25 +42,25 @@ func InitDB(filepath string) error {
 }
 
 func AddNote(content string, description string, deadline string, priority string) (int64, error) {
-    if priority == "" {
-        priority = "low"
-    }
-    
-    var res sql.Result
-    var err error
+	if priority == "" {
+		priority = "low"
+	}
 
-    if deadline == "" {
+	var res sql.Result
+	var err error
+
+	if deadline == "" {
 		res, err = DB.Exec("INSERT INTO notes (content, description, priority) VALUES (?, ?, ?)", content, description, priority)
-    } else {
+	} else {
 		res, err = DB.Exec("INSERT INTO notes (content, description, deadline, priority) VALUES (?, ?, ?, ?)", content, description, deadline, priority)
-    }
+	}
 
-    if err != nil {
-        return 0, err
-    }
+	if err != nil {
+		return 0, err
+	}
 
-    id, err := res.LastInsertId()
-    return id, err
+	id, err := res.LastInsertId()
+	return id, err
 }
 
 func DeleteNote(id int) error {
@@ -106,10 +106,10 @@ func UpdateNote(id int, content string, description string, deadline string, sta
 func GetNoteByID(id int) (models.Note, error) {
 	var n models.Note
 	var deadline sql.NullTime
-	
+
 	err := DB.QueryRow("SELECT id, content, description, created_at, deadline, notified, status, priority FROM notes WHERE id = ?", id).
 		Scan(&n.ID, &n.Content, &n.Description, &n.CreatedAt, &deadline, &n.Notified, &n.Status, &n.Priority)
-		
+
 	if deadline.Valid {
 		n.Deadline = &deadline.Time
 	}
